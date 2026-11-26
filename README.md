@@ -31,7 +31,11 @@ switches in the table below.
 - Frame times, as medians of the 5-second log lines: open water about
   141-168 ms (6-7 fps); medium scenes with 4,400-7,000 draws 180-250 ms;
   heavy scenes (town, dense foliage, 7,000-10,000 draws) 240-340 ms (3-4 fps).
-- The newest build has had three short runs, without a crash or an error.
+- The newest build has had seven short runs, without a crash or an error. The
+  best of them (about ten minutes in town with the switches in the table below,
+  no screen recorder): 154 ms at 3,000-5,000 draws, 187 ms at 5,000-7,000,
+  223 ms at 7,000-9,000 and 228 ms above 9,000; none of its 88 samples was
+  over 350 ms. One run, and not a heavy session.
 
 ## New in the first snapshot (compared with the fork it is based on)
 
@@ -113,9 +117,11 @@ Measured on the test machine (5-second log lines; weak evidence):
   comparable).
 - In play, the half-second freezes while driving were judged gone ("pretty
   decent feel").
-- `VICTORY_AMBIENT=0.6`: shaded areas are no longer pure black; judged "a lot
-  better" in play. Its cost in frame time is not measured yet (the one run
-  with it was short and recorded).
+- `VICTORY_AMBIENT=0.6`: many shaded areas are no longer pure black; judged "a
+  lot better" in play. It does not lift everything: shadows cast on open
+  ground and some building fronts stay close to black. No cost in frame time
+  was seen in the runs with it; it has not been measured against a run
+  without it.
 - No gain in steady frame time over the earlier snapshots is proven.
 
 ## Known problems
@@ -128,8 +134,12 @@ Measured on the test machine (5-second log lines; weak evidence):
   their cause is not yet found.
 - With `VICTORY_BAKE_TEXTURES_MS=0`, characters can be baked dark at first.
 - Shaded areas are black without `VICTORY_AMBIENT`: the title's bounced light
-  does not run. `VICTORY_AMBIENT=0.6` covers it with a constant fill, the
-  same everywhere; real bounced light still does not run.
+  does not run. `VICTORY_AMBIENT=0.6` covers part of it with a constant fill,
+  the same everywhere: many shaded areas become readable, but shadows cast on
+  open ground and some building fronts stay close to black. Real bounced
+  light still does not run.
+- Leaf edges, hair and thin wires look speckled or dotted, on every build of
+  this tree so far.
 - Foliage looks dotted in Series S.
 - Eight compute programs are refused by the translator.
 - No autosave was seen during a mission.
@@ -163,6 +173,7 @@ in a comment where the code reads it.
 | `VICTORY_FILLS_PLAIN=1` | a list's fills of under 256 bytes are copied in place instead of through the kernel's copy (needs `VICTORY_COPY_PLAIN=1`) |
 | `VICTORY_REUSE_TARGET_BINDS=1` | repeated bindings of the same output targets are skipped |
 | `VICTORY_AMBIENT=0.6` | where the title's ray-traced light probes would supply bounced light (they do not run here), a constant least amount of indirect light is used instead, the same everywhere; it is not real bounced light |
+| `VICTORY_CARD_REHASH_RUNS=1` | the hash passes that check the card's copies of title buffers run once per run of changed pieces instead of once per range (used in the best run above; its own share of that run's frame times is not separated yet) |
 
 If materials look wrong, `VICTORY_TABLE_CONSTANTS=0` turns off reading table
 constants in place: every table constant is then copied for the draw into
