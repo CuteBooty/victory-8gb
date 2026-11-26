@@ -1129,7 +1129,7 @@ type Job = Box<dyn FnOnce() + Send>;
 /// Threads kept for [`wide`]: what they are to do, and the word that there
 /// is something.
 struct Workers {
-    jobs: Mutex<std::collections::VecDeque<Job>>,
+    jobs: Mutex<std::collections::VecDeque<(u64, Job)>>,
     more: std::sync::Condvar,
 }
 
@@ -1149,7 +1149,7 @@ fn workers() -> &'static Workers {
                     let job = {
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
-                            if let Some(job) = jobs.pop_front() {
+                            if let Some((_, job)) = jobs.pop_front() {
                                 break job;
                             }
                             jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
@@ -1172,27 +1172,39 @@ fn wide(jobs: Vec<Job>) {
         }
         return;
     }
+    // A split source read holds its shadow's page epochs until the jobs
+    // finish. Its caller must never take unrelated work under that lock.
+    // Batch ownership follows triippywhale/victory-fork d51efcf8.
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
     let workers = workers();
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
-            queue.push_back(Box::new(move || {
+            queue.push_back((call, Box::new(move || {
                 job();
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
                     left.1.notify_all();
                 }
-            }));
+            })));
         }
     }
     workers.more.notify_all();
     loop {
-        let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        let job = {
+            let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            if split_source() {
+                queue.iter().position(|(owner, _)| *owner == call).and_then(|at| queue.remove(at))
+            } else {
+                queue.pop_front()
+            }
+        };
         match job {
-            Some(job) => job(),
+            Some((_, job)) => job(),
             None => break,
         }
     }
@@ -1211,6 +1223,43 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
+fn split_source() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_SOURCE").is_some_and(|v| v == "1"))
+}
+
+/// Read title bytes through the usual remap-safe path. Source and host
+/// ranges are disjoint, and the submitting caller keeps the mapping alive.
+fn read_source(src: usize, dst: usize, len: usize) {
+    let read = || crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::source_read(len, read);
+    #[cfg(not(feature = "diagnostics"))]
+    read();
+}
+
+fn move_source(src: usize, dst: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    if crate::copystat::source_diff() {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SCRATCH.with(|scratch| {
+            let mut bytes = scratch.borrow_mut();
+            bytes.resize(len, 0);
+            read_source(src, bytes.as_mut_ptr() as usize, len);
+            // SAFETY: this is the selected, non-busy part of the host copy.
+            let held = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, len) };
+            crate::copystat::compare_source(&bytes, held);
+            held.copy_from_slice(&bytes);
+        });
+    } else {
+        read_source(src, dst, len);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    read_source(src, dst, len);
+}
+
 /// The submission owns each mapping until its last snapshot job returns.
 #[derive(Default)]
 pub(crate) struct Snapshots {
@@ -1228,6 +1277,13 @@ impl Snapshots {
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
 /// bytes each: long ones cut, short ones together.
 fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
+    grouped_copies(copies, |src, dst, len| {
+        // SAFETY: the caller owns both mappings until all snapshot jobs finish.
+        unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+    })
+}
+
+fn grouped_copies(copies: Vec<(usize, usize, usize)>, transfer: fn(usize, usize, usize)) -> Vec<Job> {
     let mut jobs: Vec<Job> = Vec::new();
     let mut group: Vec<(usize, usize, usize)> = Vec::new();
     let mut bytes = 0;
@@ -1236,9 +1292,7 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
         if !group.is_empty() {
             jobs.push(Box::new(move || {
                 for (src, dst, len) in group {
-                    // SAFETY: the caller's ranges: a host copy's mapping and
-                    // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    transfer(src, dst, len);
                 }
             }));
         }
@@ -1399,6 +1453,26 @@ mod wide_tests {
     use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn split_source_reads_preserve_unselected_gaps_and_edges() {
+        let n = 3 * WIDE_JOB + 11;
+        let src: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let mut dst = vec![255u8; n];
+        let runs = [(3, WIDE_JOB + 19), (2 * WIDE_JOB, n - 1)];
+        let copies = runs.iter().map(|&(a, e)| {
+            (src.as_ptr() as usize + a, dst.as_mut_ptr() as usize + a, e - a)
+        }).collect();
+        let jobs = super::grouped_copies(copies, super::move_source);
+        assert_eq!(jobs.len(), 3);
+        wide(jobs);
+        assert_eq!(&dst[..3], &[255; 3]);
+        assert_eq!(dst[n - 1], 255);
+        assert!(dst[runs[0].1..runs[1].0].iter().all(|&b| b == 255));
+        for (a, e) in runs {
+            assert_eq!(dst[a..e], src[a..e]);
+        }
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
@@ -1748,7 +1822,11 @@ pub(crate) fn let_go_idle() {
             })
             .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let gone: Vec<_> = idle.into_iter().filter_map(|key| map.remove(&key)).collect();
+        if !gone.is_empty() {
+            tables_changed();
+        }
+        gone
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2563,17 +2641,24 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize, source_bytes: &mut usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
+            let mut held = Vec::new();
+            let writes = crate::watch::writes_for_copy(from, to, true, Some(&mut held));
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SourceWatchNs, started.elapsed().as_nanos() as u64);
+            if let Some((now, written)) = writes {
                 self.watched.store(1, Ordering::Relaxed);
                 #[cfg(feature = "diagnostics")]
                 let read_before = *source_bytes;
-                let copied = self.copy_stale(from, to, now, &written, source_bytes);
+                let copied = self.copy_stale(from, to, now, &written, &held, source_bytes);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, ((to - from) - (*source_bytes - read_before)) as u64);
+                    add(C::EpochSkips, u64::from(*source_bytes == read_before));
                 }
                 return copied;
             }
@@ -2650,14 +2735,26 @@ impl Shadow {
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], source_bytes: &mut usize) -> usize {
+    fn copy_stale(
+        &self, from: usize, to: usize, now: u64, written: &[(usize, u64)],
+        _held: &[(usize, bool)], source_bytes: &mut usize,
+    ) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         let (mut bytes, mut run) = (0, None);
+        #[cfg(feature = "diagnostics")]
+        let mut reread = 0;
+        let split = split_source() && to - from >= 2 * WIDE_JOB && !copy_compare();
+        let mut runs = Vec::new();
         let mut copy_run = |start, end| {
             *source_bytes += end - start;
-            self.copy(start, end)
+            if split {
+                runs.push((start, end));
+                end - start
+            } else {
+                self.copy(start, end)
+            }
         };
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
@@ -2670,6 +2767,20 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                #[cfg(feature = "diagnostics")]
+                {
+                    let n = ((page + 1) * PAGE).min(to) - (page * PAGE).max(from);
+                    if *at != 0 {
+                        reread += n;
+                    }
+                    if !_held.is_empty() && let Ok(i) = _held.binary_search_by_key(&page, |p| p.0) {
+                        use crate::copystat::{C, add};
+                        add(C::HotReadBytes, n as u64);
+                        if _held[i].1 {
+                            add(C::HotRereadBytes, n as u64);
+                        }
+                    }
+                }
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -2685,6 +2796,23 @@ impl Shadow {
         if let Some(first) = run {
             bytes += copy_run((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
         }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SourceRereadBytes, reread as u64);
+        if bytes >= 2 * WIDE_JOB && split {
+            let base = self.start as usize;
+            let copies = runs.iter().map(|&(a, e)| (a, self.data as usize + (a - base), e - a)).collect();
+            wide(grouped_copies(copies, move_source));
+            for (a, e) in runs {
+                self.changed(a - base, e - base);
+                self.card_changed(a - base, e - base);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SourceSplitBytes, bytes as u64);
+        } else {
+            for (a, e) in runs {
+                self.copy(a, e);
+            }
+        }
         bytes
     }
 
@@ -2697,7 +2825,7 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        move_source(from, at as usize, to - from);
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
@@ -2718,9 +2846,13 @@ impl Shadow {
             let mut title = s.borrow_mut();
             title.clear();
             title.resize(to - from, 0);
-            crate::host::copy_mapped(title.as_mut_ptr(), from as *const u8, to - from, false);
+            read_source(from, title.as_mut_ptr() as usize, to - from);
             // SAFETY: inside the mapping (`from` and `to` are within the buffer).
             let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), to - from) };
+            #[cfg(feature = "diagnostics")]
+            if crate::copystat::source_diff() {
+                crate::copystat::compare_source(&title, held);
+            }
             let (mut changed, mut run): (usize, Option<usize>) = (0, None);
             let mut at = 0;
             while at <= title.len() {
@@ -2989,18 +3121,23 @@ fn buffers_write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize)
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers_write().insert(
+    let mut map = buffers_write();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    tables_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers_write().remove(&(start, resource));
+    let mut map = buffers_write();
+    if map.remove(&(start, resource)).is_some() {
+        tables_changed();
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3030,14 +3167,21 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
+        if !gone.is_empty() {
+            tables_changed();
+        }
     }
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers_write();
+        let windows_removed = gone.len();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
             }
+        }
+        if gone.len() != windows_removed {
+            tables_changed();
         }
     }
     let n = gone.len() as u64;
@@ -3089,7 +3233,88 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, true)
 }
 
+/// Counts the changes of the tables [`lookup`] reads that can change what an
+/// ask finds: a buffer registered or released, a copy taken out of a table,
+/// a window made. A thread's remembered answers ([`FOUND`]) are from one
+/// count.
+static TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+fn tables_changed() {
+    TABLES_CHANGED.fetch_add(1, Ordering::Release);
+}
+
+/// Since the last frame line: asks answered from a thread's own memory of
+/// them, and asks that went to the tables.
+pub(crate) static LOOKUPS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether a thread remembers what its asks found
+/// (`VICTORY_LOOKUP_CACHE=0`: every ask goes to the tables, as before).
+fn lookup_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOKUP_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// The most asks a thread remembers before it starts again.
+const FOUND_MOST: usize = 8192;
+
+type Found = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+
+thread_local! {
+    /// What this thread's asks found, and the count of table changes they
+    /// are from.
+    static FOUND: std::cell::RefCell<(u64, Found)> = std::cell::RefCell::new((u64::MAX, Found::new()));
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    if !lookup_cache() {
+        LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+        return lookup_tables(address, len, any);
+    }
+    let changes = TABLES_CHANGED.load(Ordering::Acquire);
+    let found = FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        if f.0 != changes {
+            f.1.clear();
+            f.0 = changes;
+        }
+        f.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
+    });
+    if let Some(shadow) = found {
+        if !shadow.window {
+            LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+            return Some(shadow);
+        }
+        // The idle sweep checks the strong count and then removes its selections
+        // under this lock. Validate a window hit after that decision is complete.
+        let _windows = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if TABLES_CHANGED.load(Ordering::Acquire) == changes {
+            LOOKUPS[0].fetch_add(1, Ordering::Relaxed);
+            shadow.used.store(crate::host::moment(), Ordering::Relaxed);
+            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+            shadow.asked[1].fetch_max(address.saturating_add(len.max(1)), Ordering::Relaxed);
+            if len <= 1 {
+                shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+            }
+            return Some(shadow);
+        }
+    }
+    LOOKUPS[1].fetch_add(1, Ordering::Relaxed);
+    let shadow = lookup_tables(address, len, any)?;
+    FOUND.with(|f| {
+        let f = &mut *f.borrow_mut();
+        // (from the count read before the tables were: a change since
+        // clears it at the next ask)
+        if f.0 == changes {
+            if f.1.len() >= FOUND_MOST {
+                f.1.clear();
+            }
+            f.1.insert((address, len, any), Arc::downgrade(&shadow));
+        }
+    });
+    Some(shadow)
+}
+
+fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
     // Fast path: the buffer found has its copy already (all but the first
     // ask for a buffer), so the ask only needs the read lock.
@@ -3356,6 +3581,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        tables_changed();
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -3392,6 +3618,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    tables_changed();
     Some(shadow)
 }
 

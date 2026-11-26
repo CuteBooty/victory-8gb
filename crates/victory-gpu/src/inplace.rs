@@ -421,6 +421,14 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
+/// A whole 64 KiB view whose physical page has no sibling mapping.
+pub(crate) fn single_block_view(at: usize) -> bool {
+    let v = views();
+    v.views.get(&at).is_some_and(|&(len, section, offset)| {
+        len == K64 && v.pages.get(&(section, offset)).is_some_and(|pages| pages.as_slice() == [at])
+    })
+}
+
 /// The title views that overlap `[start, end)`, as `(address, bytes)`.
 pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
     if start >= end {
@@ -442,7 +450,21 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
-    let v = views();
+    pages_of_with_limit(&views(), page, 1..=usize::MAX)
+}
+
+/// The guard only acts on keys with 2..=MANY_VIEWS entries. In particular
+/// the shared placeholder page may have thousands of aliases.
+pub(crate) fn guard_views_of(page: usize) -> Vec<usize> {
+    static BOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *BOUND.get_or_init(|| std::env::var_os("VICTORY_BOUND_ALIAS_LOOKUP").is_none_or(|v| v != "0")) {
+        pages_of_with_limit(&views(), page, 2..=crate::watch::MANY_VIEWS)
+    } else {
+        pages_of(page)
+    }
+}
+
+fn pages_of_with_limit(v: &Views, page: usize, counts: std::ops::RangeInclusive<usize>) -> Vec<usize> {
     let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
         return Vec::new();
     };
@@ -450,7 +472,16 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     if within >= bytes || !within.is_multiple_of(K64) {
         return Vec::new();
     }
-    v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
+    let shown = v.pages.get(&(section, offset + within as u64)).map_or(&[][..], Vec::as_slice);
+    if counts.contains(&shown.len()) {
+        shown.to_vec()
+    } else {
+        #[cfg(feature = "diagnostics")]
+        if !shown.is_empty() {
+            crate::copystat::add(crate::copystat::C::AliasEntriesSkipped, shown.len() as u64);
+        }
+        Vec::new()
+    }
 }
 
 /// The title views that show any of the physical bytes `[offset, offset +
@@ -1197,6 +1228,29 @@ pub(crate) fn tick() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn guard_aliases_match_unbounded_lookup_at_both_limits() {
+        let page = super::K64;
+        let mut v = super::Views {
+            views: [(page, (page, 42, 0))].into(),
+            pages: Default::default(),
+            sections: Vec::new(),
+            own: Vec::new(),
+        };
+        let max = crate::watch::MANY_VIEWS;
+        for count in [0, 1, 2, max, max + 1] {
+            let aliases: Vec<_> = (1..=count).map(|i| i * page).collect();
+            v.pages.insert((42, 0), aliases.clone());
+            assert_eq!(super::pages_of_with_limit(&v, page, 1..=usize::MAX), aliases);
+            let guarded = super::pages_of_with_limit(&v, page, 2..=max);
+            if (2..=max).contains(&count) {
+                assert_eq!(guarded, aliases);
+            } else {
+                assert!(guarded.is_empty());
+            }
+        }
+    }
+
     use super::*;
 
     /// Views as the runtime tells them: a range inside one view, or over

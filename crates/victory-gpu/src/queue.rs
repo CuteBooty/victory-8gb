@@ -454,6 +454,12 @@ thread_local! {
     static RELEASING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// This thread owns the serialized queue drain, including both parts of a split.
+#[cfg(windows)]
+pub(crate) fn releasing_here() -> bool {
+    RELEASING_HERE.get()
+}
+
 /// Before a submission of ours that is waited for, with [`behind`]: what
 /// the queues hold and is free to run runs first, on this thread, so the
 /// submission keeps its place behind them.
@@ -949,7 +955,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+#[cfg(any(windows, feature = "diagnostics"))]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -966,19 +972,46 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(windows)]
+    let wait_start = crate::host::frame_end::begin();
+    #[cfg(windows)]
+    let mut full_wait = false;
+    #[cfg(windows)]
+    let tagged_present = crate::host::frame_end::cut();
+    #[cfg(windows)]
+    if tagged_present {
+        release_held_now(false);
+        // Landing a producer can free another queue and reveal more producers.
+        // Drain it before choosing the boundary. If no new producer can free
+        // an outstanding queue wait, preserve stage 2's settle-before-force.
+        let mut waited = 0;
+        loop {
+            let Some(t) = crate::host::frame_end::last_producer() else {
+                full_wait = true;
+                break;
+            };
+            if lock(&WAITING).is_empty() { break; }
+            if t.number() <= waited || !t.wait() {
+                full_wait = true;
+                break;
+            }
+            waited = t.number();
+            release_held_now(false);
+        }
+    }
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
-    if crate::host::late() && !crate::host::late_free_present() {
+    if crate::host::late() && (!crate::host::late_free_present() || full_wait) {
         // (With `behind`: what the queues hold runs here first, and what
         // it sent is settled with the rest.)
-        if behind() {
+        if behind() && !tagged_present {
             release_held_now(false);
         }
         crate::host::settle_for_present();
         release_held_now(false);
         crate::host::settle_for_present();
-    } else if crate::host::late() {
+    } else if crate::host::late() && !tagged_present {
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.
         release_held_now(false);
@@ -991,7 +1024,18 @@ extern "system" fn present(
     #[cfg(windows)]
     let upto = crate::host::started();
     #[cfg(windows)]
-    crate::host::feedback::before_present(upto);
+    let boundary = crate::host::frame_end::boundary(wait_start);
+    #[cfg(windows)]
+    if tagged_present {
+        if !full_wait {
+            full_wait = boundary.as_ref().is_none_or(|b| !b.wait_tagged());
+        }
+        if full_wait { crate::host::settle_for_present(); }
+    } else {
+        crate::host::feedback::before_present(upto);
+    }
+    #[cfg(windows)]
+    let barrier_end = crate::host::frame_end::end_wait();
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -1058,7 +1102,7 @@ extern "system" fn present(
             let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
             (r, t, was)
         });
-        let shown = host.present(texture, state, frame, over.map(|(_, t, was)| (t, was)));
+        let shown = host.present(texture, state, frame, full_wait, over.map(|(_, t, was)| (t, was)));
         if let Some((r, _, was)) = over {
             crate::resource::host_transition(r, was);
         }
@@ -1078,6 +1122,8 @@ extern "system" fn present(
     // are in the line. No lock of ours is held here.
     #[cfg(windows)]
     crate::host::settle_backs(upto);
+    #[cfg(windows)]
+    if let Some(b) = boundary { b.report(barrier_end, full_wait); }
     PRESENTS_DONE.fetch_add(1, Ordering::Release);
     S_OK
 }

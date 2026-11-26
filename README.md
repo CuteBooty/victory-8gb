@@ -31,9 +31,10 @@ switches in the table below.
 - Frame times, as medians of the 5-second log lines: open water about
   141-168 ms (6-7 fps); medium scenes with 4,400-7,000 draws 180-250 ms;
   heavy scenes (town, dense foliage, 7,000-10,000 draws) 240-340 ms (3-4 fps).
-- The newest build in this snapshot has had two short runs only.
+- The newest build in this snapshot has had eight short runs (six of this exact build), without a crash
+  or an error, with the optional switches listed below the table.
 
-## New in this snapshot (compared with the fork it is based on)
+## New in the first snapshot (compared with the fork it is based on)
 
 - Table constants read in place (ported from upstream `683ad7a9`): descriptor
   tables holding a constant buffer no longer need fresh slots for every draw.
@@ -47,6 +48,45 @@ switches in the table below.
 - Descriptor heap lock split (fork PR #1146).
 - Series S profile (fork PR #188).
 
+## What changed since the first snapshot
+
+All new behaviour is behind switches (see "Switches added since the first
+snapshot" below), and each one that is on by default can be turned off.
+
+- Six ports, credited in CREDITS.md: repeated output target bindings skipped
+  (fork PR 1215); card copies brought up to date in three batched steps
+  (fork PR 1227); merged write intervals compacted in place (fork PR 1232); a
+  per-thread memory of buffer lookups (fork PR 1237); short fills of upload
+  memory copied in place (fork main `de4146a0`); counters of where a
+  landing's time goes (triippywhale `962e6af5`).
+- Cheaper copies of title memory: source reads of one refresh split over the
+  worker pool, asks that are already held skipped, a bounded alias lookup,
+  and counters for all of it.
+- Four cuts in the handling of write guards, each behind its own switch and
+  off by default, with counters.
+- Frame end: counters of what the present waits for, and an experimental
+  present that waits only for the read-backs the title needs
+  (`VICTORY_LATE_WAIT=3`).
+- Input: stale latched and queued presses are dropped instead of replayed
+  late, and an optional trace of the button edges the title is given.
+
+Measured on the test machine (medians of the 5-second log lines, one or two
+runs each, so weak evidence):
+
+- Heavy scenes at 7,000-9,000 draws: 232-270 ms on this tree against
+  241-245 ms on the first snapshot. No proven gain in steady frame time.
+- The stalls while driving were measured as the texture refresh waiting on
+  the title's memory remaps: 16-39 ms a frame on average, single waits up to
+  0.7-0.8 s. `VICTORY_MAPPING_RANGES=1` removed that wait (0.1 ms average),
+  but its run was not faster on average (313 against 270 ms in heavy frames,
+  one pair of runs).
+- `VICTORY_LATE_WAIT=3` is experimental and slower; not recommended. One
+  run: heavy frames (7,000-9,000 draws) averaged 559 ms against 270 ms with
+  `VICTORY_LATE_WAIT=2`; about six submission splits a frame, the present
+  still waited 58-70 ms and only about 3 ms of that was recovered; it felt
+  slower in play. The recommended value stays 2.
+- 1280x720 output did not reduce card time and is not recommended.
+
 ## Known problems
 
 - Slow (see the frame times above).
@@ -54,7 +94,9 @@ switches in the table below.
   wait costs 70-90 ms a frame in heavy scenes.
 - Stalls while the texture refresh waits for title memory to stop moving.
 - With `VICTORY_BAKE_TEXTURES_MS=0`, characters can be baked dark at first.
-- Shaded areas can be black: bounced light does not run.
+- Shaded areas can be black: bounced light does not run. They are still
+  black in this snapshot (`VICTORY_AMBIENT`, which adds a least amount of
+  indirect light, was not tested here).
 - Foliage looks dotted in Series S.
 - Eight compute programs are refused by the translator.
 - No autosave was seen during a mission.
@@ -88,6 +130,36 @@ in a comment where the code reads it.
 If materials look wrong, `VICTORY_TABLE_CONSTANTS=0` turns off reading table
 constants in place: every table constant is then copied for the draw into
 upload memory, as before (more descriptor slots, slower).
+
+Optional, on top of the table: `VICTORY_FILLS_PLAIN=1`, `VICTORY_COPY_PLAIN=1`
+and `VICTORY_REUSE_TARGET_BINDS=1`. They were set in every run of the newest
+build and its two predecessors (eight short runs, no crash, no errors); no frame-time gain from them is
+proven.
+
+### Switches added since the first snapshot
+
+Defaults as the code reads them. "On" switches are turned off with `=0`;
+"off" switches are turned on with `=1` unless stated otherwise.
+
+| Switch | Default | What it does |
+|---|---|---|
+| `VICTORY_CARD_SYNC_BATCH` | on | the list that brings copies in the card's memory up to date records every changed range, then every state change in one call, then every hash pass, instead of copy by copy |
+| `VICTORY_LOOKUP_CACHE` | on | a thread remembers what its asks for a buffer's host copy found, until the tables change |
+| `VICTORY_BOUND_ALIAS_LOOKUP` | on | the guard looks up other views only for pages with a bounded number of them (the shared placeholder page can have thousands) |
+| `VICTORY_SKIP_HELD_ASK` | on | the submitting thread skips building ranges for a kernel ask that is already held and would be discarded |
+| `VICTORY_LATCH_DROP_STALE` | on | queued taps expire from the time of the physical press; only live levels after two seconds without reads; pending presses cleared on focus loss and pad disconnect (`=0`: replayed as before) |
+| `VICTORY_FILLS_PLAIN` | off | a list's fills of under 256 bytes are copied in place instead of through the kernel's copy; needs `VICTORY_COPY_PLAIN=1`; `=alt` switches it every 20 seconds for comparisons |
+| `VICTORY_REUSE_TARGET_BINDS` | off | repeated bindings of the same output targets are skipped |
+| `VICTORY_SPLIT_SOURCE` | off | disjoint runs of one refresh read from title memory as jobs on the worker pool |
+| `VICTORY_GUARD_DIRECT_OPEN` | off | a write fault on one guarded block opens that block directly |
+| `VICTORY_GUARD_REUSE_ARM` | off | a guarded block with other views that is still read-only is noted clean and only its other views are guarded again, without a new call for the block itself |
+| `VICTORY_GUARD_BATCH_ALIAS` | off | the other views of a guarded run are armed in one call, retried block by block if Windows refuses it |
+| `VICTORY_GUARD_HOT` | off | views that fault again and again are held open across shadow refreshes |
+| `VICTORY_LATE_WAIT=3` | (2 recommended) | experimental and slower: the submission is split after the last producer of a read-back the title needs, and a present sent ahead waits only for those (falls back to stage 2 without the relay) |
+| `VICTORY_LATE_SET` | `exposure+water` | with `VICTORY_LATE_WAIT=3`, which read-backs the present waits for: `exposure`, `exposure+water` or `all` (unknown values mean `all`) |
+| `VICTORY_FRAME_END_WHY` | off | with `VICTORY_LATE_WAIT` 2 or 3, a 5-second line of what the present waits for (diagnostic) |
+| `VICTORY_SOURCE_DIFF` | off | with guarded copies (the default copy mode), a census of how many source bytes really changed (diagnostic) |
+| `VICTORY_INPUT_WHY` | off | logs each button edge the title is given, with its source (diagnostic) |
 
 ## Building
 

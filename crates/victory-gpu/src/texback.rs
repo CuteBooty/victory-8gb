@@ -111,6 +111,11 @@ impl Back {
         (self.at, self.at + self.layout.size as usize)
     }
 
+    pub(crate) fn rows(&self) -> u64 {
+        self.rows.iter().zip(&self.footprints)
+            .map(|(&rows, f)| u64::from(rows) * u64::from(f.Footprint.Depth)).sum()
+    }
+
     pub(crate) fn record(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
         for (i, footprint) in self.footprints.iter().enumerate() {
             let to = D3D12_TEXTURE_COPY_LOCATION {
@@ -169,13 +174,14 @@ impl Back {
         if crate::host::write_texture(self.at, &tiled) { Ok(()) } else { Err(Skip::Short) }
     }
 
-    pub(crate) fn land(&self) {
+    pub(crate) fn land(&self) -> bool {
         let start = Instant::now();
         let result = self.copy_to_title();
         let elapsed = start.elapsed();
         let mut stats = STATS.lock().unwrap_or_else(|e| e.into_inner());
         stats.add(self.kind, self.layout.size, result);
         stats.time += elapsed;
+        result.is_ok()
     }
 }
 

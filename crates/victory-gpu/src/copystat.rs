@@ -163,6 +163,36 @@ pub(crate) enum C {
     /// host copy), and those copied for it (`VICTORY_TABLE_CONSTANTS`).
     TableConstantsInPlace,
     TableConstantsFallback,
+    SourceWatchNs,
+    KernelWatchNs,
+    KernelWatchCalls,
+    GuardArmCalls,
+    GuardOpenCalls,
+    GuardArmNs,
+    GuardOpenNs,
+    GuardArmPages,
+    FaultOpenedPages,
+    GuardHandlerNs,
+    GuardHandlerCalls,
+    GuardHandlerWaitNs,
+    HotViews,
+    HotReadBytes,
+    HotRereadBytes,
+    GuardCleanUs,
+    GuardKnownDirtyUs,
+    GuardFallbackUs,
+    ReuseArmBlocks,
+    AliasBatchSaved,
+    AliasBatchFailed,
+    AliasEntriesSkipped,
+    EpochSkips,
+    SourceReadNs,
+    SourceReadBytes,
+    SourceRereadBytes,
+    SourceSplitBytes,
+    DiffExamined,
+    DiffBytes,
+    DiffNs,
     DynamicFramePeak,
 }
 const COUNTERS: usize = C::DynamicFramePeak as usize + 1;
@@ -264,6 +294,7 @@ pub(crate) fn mode() -> u8 {
 struct RangeStats {
     checks: u64,
     no_read: u64,
+    no_read_us: u64,
     read_bytes: u64,
     us: u64,
 }
@@ -272,6 +303,9 @@ impl RangeStats {
     fn record(&mut self, source_bytes: usize, us: u64) {
         self.checks += 1;
         self.no_read += u64::from(source_bytes == 0);
+        if source_bytes == 0 {
+            self.no_read_us += us;
+        }
         self.read_bytes += source_bytes as u64;
         self.us += us;
     }
@@ -279,6 +313,49 @@ impl RangeStats {
 
 type Ranges = HashMap<(usize, usize), RangeStats>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
+
+// Only the first transfer by a thread in a reporting interval takes the lock.
+static SOURCE_INTERVAL: AtomicU64 = AtomicU64::new(1);
+static SOURCE_THREADS: Mutex<usize> = Mutex::new(0);
+static ACTIVE_READERS: AtomicU64 = AtomicU64::new(0);
+static PEAK_READERS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn source_read(bytes: usize, read: impl FnOnce()) {
+    let active = ACTIVE_READERS.fetch_add(1, Relaxed) + 1;
+    PEAK_READERS.fetch_max(active, Relaxed);
+    let started = std::time::Instant::now();
+    read();
+    let elapsed = started.elapsed();
+    ACTIVE_READERS.fetch_sub(1, Relaxed);
+    add(C::SourceReadBytes, bytes as u64);
+    add(C::SourceReadNs, elapsed.as_nanos() as u64);
+    thread_local! { static LAST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+    LAST.with(|last| {
+        if last.get() != SOURCE_INTERVAL.load(Relaxed) {
+            let mut count = SOURCE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+            *count += 1;
+            last.set(SOURCE_INTERVAL.load(Relaxed));
+        }
+    });
+}
+
+pub(crate) fn source_diff() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| mode() == 0 && std::env::var_os("VICTORY_SOURCE_DIFF").is_some_and(|v| v == "1"))
+}
+
+fn different_bytes(a: &[u8], b: &[u8]) -> usize {
+    debug_assert_eq!(a.len(), b.len());
+    a.chunks(64).zip(b.chunks(64)).filter(|(a, b)| a != b)
+        .map(|(a, b)| a.iter().zip(b).filter(|(x, y)| x != y).count()).sum()
+}
+
+pub(crate) fn compare_source(bytes: &[u8], held: &[u8]) {
+    let started = std::time::Instant::now();
+    add(C::DiffBytes, different_bytes(bytes, held) as u64);
+    add(C::DiffExamined, bytes.len() as u64);
+    add(C::DiffNs, started.elapsed().as_nanos() as u64);
+}
 
 // Sum acquisition time on all refresh threads between successive presents.
 // The separate one-second refresh counters are reset on a different clock.
@@ -305,12 +382,24 @@ mod refresh_stats_tests {
     use super::{RangeStats, mapping_wait_ms};
 
     #[test]
+    fn byte_census_counts_changes_across_blocks_and_in_the_tail() {
+        let a = [0; 131];
+        let mut b = a;
+        assert_eq!(super::different_bytes(&a, &b), 0);
+        for i in [0, 63, 64, 130] {
+            b[i] = 1;
+        }
+        assert_eq!(super::different_bytes(&a, &b), 4);
+    }
+
+    #[test]
     fn repeated_checks_count_only_the_source_bytes_selected() {
         let mut stats = RangeStats::default();
         for selected in [16, 0, 4, 0] {
             stats.record(selected, 1);
         }
         assert_eq!((stats.checks, stats.no_read, stats.read_bytes), (4, 2, 20));
+        assert_eq!(stats.no_read_us, 2);
     }
 
     #[test]
@@ -1290,6 +1379,43 @@ pub(crate) fn log(frames: f64) {
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     let no_read: u64 = ranges.iter().map(|(_, stats)| stats.no_read).sum();
+    let threads = {
+        let mut count = SOURCE_THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        SOURCE_INTERVAL.fetch_add(1, Relaxed);
+        std::mem::take(&mut *count)
+    };
+    let peak_readers = PEAK_READERS.swap(0, Relaxed);
+    tracing::info!(
+        "shadow source per frame: {:.2} ms querying the watch (including guards, journal and lock), \
+         {:.2} ms reading {:.2} MB (thread sum, {threads} distinct readers, peak {peak_readers} simultaneously this interval), \
+         {:.2} MB reread from previously fully copied pages, {:.2} MB in split batches, {:.0} ranges skipped by page epochs; \
+         source difference census {}: {:.3} MB different of {:.2} MB examined, {:.2} ms comparing; \
+         all callers: {:.0} GetWriteWatch/reset calls {:.2} ms including failures, {:.0} guard arm calls {:.2} ms / {:.0} open calls {:.2} ms, \
+         {:.0} alias entries left unallocated",
+        c[C::SourceWatchNs as usize] / 1e6, c[C::SourceReadNs as usize] / 1e6, mb(c[C::SourceReadBytes as usize]),
+        mb(c[C::SourceRereadBytes as usize]), mb(c[C::SourceSplitBytes as usize]), c[C::EpochSkips as usize],
+        if source_diff() { "on" } else { "off" },
+        mb(c[C::DiffBytes as usize]), mb(c[C::DiffExamined as usize]), c[C::DiffNs as usize] / 1e6,
+        c[C::KernelWatchCalls as usize], c[C::KernelWatchNs as usize] / 1e6, c[C::GuardArmCalls as usize],
+        c[C::GuardArmNs as usize] / 1e6, c[C::GuardOpenCalls as usize], c[C::GuardOpenNs as usize] / 1e6,
+        c[C::AliasEntriesSkipped as usize],
+    );
+    let guard_faults = c[C::GuardFaults as usize];
+    let pages_per_fault = if guard_faults > 0.0 { c[C::FaultOpenedPages as usize] / guard_faults } else { 0.0 };
+    tracing::info!(
+        "view guards per frame: {guard_faults:.1} faults, {pages_per_fault:.1} successful 4 KiB pages opened/fault; \
+         {:.1} arm calls, {:.1} successful 4 KiB pages armed, {:.2} ms in arm syscalls; \
+         {:.2} ms in {:.1} write-handler entries (thread sum, {:.2} ms acquiring guards); \
+         {:.1} hot views held open, {:.3} MB shadow reads on holds ({:.3} MB on repeat checks); \
+         old guard timer: {:.2} ms known clean, {:.2} ms known dirty, {:.2} ms fallback; \
+         {:.1} already-armed alias blocks reused, alias batching saved {:.1} calls, {:.1} failed batches",
+        c[C::GuardArmCalls as usize], c[C::GuardArmPages as usize], c[C::GuardArmNs as usize] / 1e6,
+        c[C::GuardHandlerNs as usize] / 1e6, c[C::GuardHandlerCalls as usize], c[C::GuardHandlerWaitNs as usize] / 1e6,
+        c[C::HotViews as usize], mb(c[C::HotReadBytes as usize]), mb(c[C::HotRereadBytes as usize]),
+        ms(c[C::GuardCleanUs as usize]), ms(c[C::GuardKnownDirtyUs as usize]),
+        ms(c[C::GuardFallbackUs as usize]), c[C::ReuseArmBlocks as usize],
+        c[C::AliasBatchSaved as usize], c[C::AliasBatchFailed as usize],
+    );
     let avoided: u64 = ranges.iter().map(|((_, len), stats)| *len as u64 * stats.checks - stats.read_bytes).sum();
     let (wait_mean, wait_median, wait_worst) = {
         let mut waits = FRAME_MAPPING_WAITS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1604,12 +1730,13 @@ pub(crate) fn log(frames: f64) {
         let kind = info.Type;
         tracing::info!(
             "  shadow refresh {src:#x}+{len:#x} (memory {kind:#x}) per frame: {:.1} checks, {:.1} with no source copy, \
-             {:.2} MB requested, {:.2} MB selected for reading, {:.2} ms",
+             {:.2} MB requested, {:.2} MB selected for reading, {:.2} ms ({:.3} ms on no-source checks)",
             stats.checks as f64 / frames,
             stats.no_read as f64 / frames,
             len as f64 * stats.checks as f64 / 1e6 / frames,
             stats.read_bytes as f64 / 1e6 / frames,
-            stats.us as f64 / 1e3 / frames
+            stats.us as f64 / 1e3 / frames,
+            stats.no_read_us as f64 / 1e3 / frames
         );
     }
 }

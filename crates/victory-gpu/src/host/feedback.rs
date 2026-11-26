@@ -184,7 +184,7 @@ pub(super) fn readback_result(extent: [u32; 3], bytes: usize, mapped: bool, subm
     }
 }
 
-fn footprint_kind(extent: [u32; 3]) -> usize {
+pub(super) fn footprint_kind(extent: [u32; 3]) -> usize {
     match extent {
         [1, 1, 1] => 0,
         [5, 1, 1] => 1,
@@ -410,6 +410,7 @@ mod tests {
     fn a_query_map_waits_for_the_flight_that_owns_the_write() {
         let flight = |number| {
             Late::Run(super::super::Flight {
+                frame_end: None,
                 number,
                 fence: number,
                 lists: Vec::new(),

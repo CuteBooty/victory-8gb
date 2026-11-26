@@ -103,6 +103,14 @@ struct KeyState {
     dead_key: bool,
 }
 
+/// A pad button mask or virtual key, and how the sample produced it.
+#[derive(Clone, Copy)]
+struct ButtonCause {
+    id: u32,
+    phase: &'static str,
+    key: Option<u8>,
+}
+
 const _: () = assert!(size_of::<KeyState>() == 12 && size_of::<PadState>() == 28);
 
 /// Host input, or a fake in tests.
@@ -111,6 +119,10 @@ trait Source: Send {
     fn pad(&mut self, slot: usize, looks: u64) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self, looks: u64) -> Vec<KeyState>;
+    /// Non-physical contributions to this sample, when tracing is enabled.
+    fn button_causes(&self, _device: usize) -> Vec<ButtonCause> {
+        Vec::new()
+    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -123,7 +135,12 @@ const LATCH_LOOKS: u64 = 2;
 const LATCH_MAX: Duration = Duration::from_secs(2);
 /// Presses of a button that has not been let go by the latch yet, kept to
 /// come out one by one after it, at most.
-const LATCH_QUEUE: u8 = 2;
+const LATCH_QUEUE: usize = 2;
+
+static DROP_STALE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("VICTORY_LATCH_DROP_STALE").is_none_or(|v| v != "0"));
+static INPUT_WHY: LazyLock<bool> =
+    LazyLock::new(|| std::env::var_os("VICTORY_INPUT_WHY").is_some_and(|v| v == "1"));
 
 /// Looks per down phase and per pause: [`LATCH_LOOKS`], or
 /// `VICTORY_TAP_LATCH_LOOKS=<n>` (n > 0), read once.
@@ -144,10 +161,12 @@ struct Press {
     id: u32,
     /// Looks when the current phase (down, or the pause) began.
     at: u64,
-    /// When the current phase began.
+    /// Start of the pause, or the physical press time for a down phase
+    /// (start of the replay instead in legacy mode).
     since: Instant,
     /// Presses of it made since, still to come out one by one.
-    queued: u8,
+    queued: VecDeque<Instant>,
+    replay: bool,
     /// In the pause between two presses: reported up.
     pause: bool,
 }
@@ -171,6 +190,8 @@ struct Latch {
     held: Vec<Press>,
     /// The keys or buttons down at the last poll, to tell a new press.
     was: Vec<u32>,
+    /// Most recent poll that observed a change in the source's look count.
+    last_look: Option<(u64, Instant)>,
 }
 
 impl Latch {
@@ -183,22 +204,55 @@ impl Latch {
         if *OFF {
             return down.to_vec();
         }
-        let n = latch_looks();
+        self.sample(down, looks, now, *DROP_STALE, latch_looks())
+    }
+
+    fn sample(
+        &mut self,
+        down: &[u32],
+        looks: u64,
+        now: Instant,
+        drop_stale: bool,
+        n: u64,
+    ) -> Vec<u32> {
         let was = std::mem::replace(&mut self.was, down.to_vec());
-        self.held.retain_mut(|p| {
-            // Pressed again (it was up at the last poll) while still kept.
-            if down.contains(&p.id) && !was.contains(&p.id) {
-                p.queued = (p.queued + 1).min(LATCH_QUEUE);
+        if drop_stale {
+            let (count, seen) = self.last_look.get_or_insert((looks, now));
+            let idle = now.duration_since(*seen) >= LATCH_MAX;
+            let resumed = *count != looks;
+            if resumed {
+                (*count, *seen) = (looks, now);
             }
-            if looks < p.at + n && now.duration_since(p.since) < LATCH_MAX {
+            if idle {
+                // While idle, report only live levels. On resuming, only a
+                // fresh physical edge can start a latch.
+                self.held.clear();
+                if !resumed {
+                    return down.to_vec();
+                }
+            }
+        }
+        self.held.retain_mut(|p| {
+            if drop_stale {
+                p.queued.retain(|&at| now.duration_since(at) < LATCH_MAX);
+            }
+            // Pressed again (it was up at the last poll) while still kept.
+            if down.contains(&p.id) && !was.contains(&p.id) && p.queued.len() < LATCH_QUEUE {
+                p.queued.push_back(now);
+            }
+            if p.pause && p.queued.is_empty() {
+                return false;
+            }
+            if looks.saturating_sub(p.at) < n && now.duration_since(p.since) < LATCH_MAX {
                 return true; // the phase goes on
             }
             if p.pause {
                 // The pause is over: down for the next queued press.
-                p.queued = p.queued.saturating_sub(1);
-                (p.at, p.since, p.pause) = (looks, now, false);
+                let pressed = p.queued.pop_front().expect("pause has a queued press");
+                p.since = if drop_stale { pressed } else { now };
+                (p.at, p.pause, p.replay) = (looks, false, true);
                 true
-            } else if p.queued > 0 {
+            } else if !p.queued.is_empty() {
                 // This press has been seen: up for a while before the next.
                 (p.at, p.since, p.pause) = (looks, now, true);
                 true
@@ -208,17 +262,20 @@ impl Latch {
             }
         });
         for &id in down {
-            if !self.held.iter().any(|p| p.id == id) {
+            if !was.contains(&id) && !self.held.iter().any(|p| p.id == id) {
                 self.held.push(Press {
                     id,
                     at: looks,
                     since: now,
-                    queued: 0,
+                    queued: VecDeque::new(),
+                    replay: false,
                     pause: false,
                 });
             }
         }
-        self.held.iter().filter(|p| !p.pause).map(|p| p.id).collect()
+        let mut reported: Vec<_> = self.held.iter().filter(|p| !p.pause).map(|p| p.id).collect();
+        reported.extend(down.iter().copied().filter(|id| !self.held.iter().any(|p| p.id == *id)));
+        reported
     }
 }
 
@@ -340,6 +397,8 @@ pub struct Reading {
     sequence: u64,
     timestamp: u64,
     value: Value,
+    /// Updated while this is current, then frozen for historical getters.
+    causes: Option<Box<Mutex<Vec<ButtonCause>>>>,
 }
 
 impl Reading {
@@ -443,6 +502,8 @@ pub struct Hub {
     /// Successful current readings per input source. The stand-in pad and
     /// keyboard are two views of the same sampled keys.
     looks: [AtomicU64; DEVICES],
+    /// Last button levels actually copied to the title, per device.
+    delivered: Mutex<[Vec<ButtonCause>; DEVICES]>,
     state: Mutex<State>,
     /// A device callback returned.
     returned: Condvar,
@@ -475,6 +536,7 @@ impl Hub {
             devices: std::array::from_fn(Device::new),
             source: Mutex::new(source),
             looks: Default::default(),
+            delivered: Default::default(),
             state: Mutex::new(State {
                 slots: Default::default(),
                 callbacks: Vec::new(),
@@ -512,13 +574,27 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        let (pads, keys) = {
+        let (pads, keys, causes) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] =
                 std::array::from_fn(|i| source.pad(i, self.looks[i].load(Ordering::Relaxed)));
-            (pads, source.keys(self.looks[KEYBOARD].load(Ordering::Relaxed)))
+            let keys = source.keys(self.looks[KEYBOARD].load(Ordering::Relaxed));
+            let causes: Option<[_; DEVICES]> =
+                (*INPUT_WHY).then(|| std::array::from_fn(|i| source.button_causes(i)));
+            (pads, keys, causes)
         };
-        let events = self.state().poll(&self.devices, pads, keys);
+        let events = {
+            let mut state = self.state();
+            let events = state.poll(&self.devices, pads, keys);
+            if let Some(causes) = causes {
+                for (slot, why) in state.slots.iter().zip(causes).filter(|(s, _)| s.connected) {
+                    if let Some(saved) = slot.history.back().and_then(|r| r.causes.as_deref()) {
+                        *lock(saved) = why;
+                    }
+                }
+            }
+            events
+        };
         self.deliver(events);
     }
 
@@ -603,6 +679,7 @@ impl State {
                 sequence: slot.sequence,
                 timestamp: now,
                 value,
+                causes: (*INPUT_WHY).then(Box::default),
             }));
         }
         if was != slot.connected {
@@ -732,7 +809,10 @@ extern "system" fn current_reading(
         "current reading"
     );
     let hr = hand(out, found.map(|(_, r)| r));
-    if hr == S_OK && let Some((i, _)) = found {
+    if hr == S_OK && let Some((i, r)) = found {
+        if *INPUT_WHY && device.is_null() {
+            tracing::info!(kind, device = i, sequence = r.sequence, "input current device selected");
+        }
         let source = if i == FALLBACK { KEYBOARD } else { i };
         hub.looks[source].fetch_add(1, Ordering::Relaxed);
     }
@@ -1113,13 +1193,20 @@ extern "system" fn reading_device(this: *const Reading, out: *mut *const Device)
     }
 }
 extern "system" fn key_count(this: *const Reading) -> u32 {
-    match &reading(this).value {
-        Value::Keys(keys) => keys.len() as u32,
+    let reading = reading(this);
+    match &reading.value {
+        Value::Keys(keys) => {
+            if *INPUT_WHY && keys.is_empty() {
+                trace_buttons(reading, std::iter::empty(), false);
+            }
+            keys.len() as u32
+        }
         Value::Pad(_) => 0,
     }
 }
 extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyState) -> u32 {
-    let Value::Keys(keys) = &reading(this).value else {
+    let reading = reading(this);
+    let Value::Keys(keys) = &reading.value else {
         return 0;
     };
     if out.is_null() {
@@ -1128,13 +1215,27 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     let n = keys.len().min(count as usize);
     // SAFETY: the title passes room for `count` keys.
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
+    if *INPUT_WHY {
+        trace_buttons(
+            reading,
+            keys[..n].iter().map(|k| u32::from(k.virtual_key)),
+            n < keys.len(),
+        );
+    }
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
-    match &reading(this).value {
+    let reading = reading(this);
+    match &reading.value {
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
+            if *INPUT_WHY {
+                let buttons = (0..32)
+                    .map(|bit| 1u32 << bit)
+                    .filter(|mask| state.buttons & mask != 0);
+                trace_buttons(reading, buttons, false);
+            }
             true
         }
         _ => false,
@@ -1143,6 +1244,55 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
 /// Kinds our devices do not have: no count, no state.
 extern "system" fn nothing(_: *const c_void) -> usize {
     0
+}
+
+fn trace_buttons(reading: &Reading, ids: impl Iterator<Item = u32>, partial: bool) {
+    // SAFETY: a reading refers to its hub's permanent device.
+    let device = unsafe { &*reading.device };
+    let Some(causes) = reading.causes.as_deref() else {
+        return;
+    };
+    let latest = device.hub().state().slots[device.index].sequence;
+    let mut delivered = lock(&device.hub().delivered);
+    let previous = &mut delivered[device.index];
+    let causes = lock(causes);
+    let physical = |id| ButtonCause {
+        id,
+        phase: "physical",
+        key: match device.index {
+            KEYBOARD => Some(id as u8),
+            FALLBACK => FALLBACK_BUTTONS.iter().find(|(_, mask)| *mask == id).map(|&(vk, _)| vk),
+            _ => None,
+        },
+    };
+    let current: Vec<_> = ids
+        .map(|id| causes.iter().find(|c| c.id == id).copied().unwrap_or_else(|| physical(id)))
+        .collect();
+    let edge = |down: bool, c: &ButtonCause| {
+        tracing::info!(
+            device = device.index, pad_slot = ?(device.index < PADS).then_some(device.index),
+            key = ?c.key, button = c.id, down, source = c.phase, sequence = reading.sequence,
+            latest, age_us = now().saturating_sub(reading.timestamp), "input edge delivered"
+        );
+    };
+    // A caller-supplied short buffer says nothing about omitted keys.
+    if !partial {
+        previous.retain(|old| {
+            let down = current.iter().any(|c| c.id == old.id);
+            if !down {
+                edge(false, causes.iter().find(|c| c.id == old.id).unwrap_or(old));
+            }
+            down
+        });
+    }
+    for c in current {
+        if let Some(old) = previous.iter_mut().find(|old| old.id == c.id) {
+            *old = c;
+        } else {
+            edge(true, &c);
+            previous.push(c);
+        }
+    }
 }
 
 static READING: Table<25> = Table([
@@ -1252,6 +1402,11 @@ mod host {
         keys: Latch,
         /// Button presses, per pad.
         buttons: [Latch; PADS],
+        last_focus: Option<bool>,
+        #[cfg(feature = "diagnostics")]
+        script_pad: Vec<u8>,
+        #[cfg(feature = "diagnostics")]
+        script_keys: Vec<u8>,
     }
 
     impl Source for Host {
@@ -1263,6 +1418,9 @@ mod host {
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                if *DROP_STALE {
+                    self.buttons[slot] = Latch::default();
+                }
                 return None;
             }
             self.empty_until[slot] = None;
@@ -1281,10 +1439,14 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
+                let keys = scripted();
+                for &vk in &keys {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
+                }
+                if *INPUT_WHY {
+                    self.script_pad = keys;
                 }
             }
             Some(pad)
@@ -1295,7 +1457,15 @@ mod host {
             let mut down = scripted();
             #[cfg(not(feature = "diagnostics"))]
             let mut down = Vec::new();
-            if focused() {
+            #[cfg(feature = "diagnostics")]
+            if *INPUT_WHY {
+                self.script_keys.clone_from(&down);
+            }
+            let focus = focused();
+            if *INPUT_WHY && self.last_focus.replace(focus) != Some(focus) {
+                tracing::info!(focused = focus, "input keyboard focus");
+            }
+            if focus {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
                 let held: Vec<u8> = (0x08..=0xFE_u8)
@@ -1312,6 +1482,10 @@ mod host {
                         down.push(vk);
                     }
                 }
+            } else if *DROP_STALE {
+                // Do not resume a pending keyboard phase after focus returns.
+                // Keep the raw baseline so a continuously held key stays live.
+                self.keys.held.clear();
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1323,6 +1497,61 @@ mod host {
                     ..Default::default()
                 })
                 .collect()
+        }
+
+        fn button_causes(&self, device: usize) -> Vec<ButtonCause> {
+            let latch = if device < PADS {
+                &self.buttons[device]
+            } else {
+                &self.keys
+            };
+            let mapped_key = |vk| {
+                FALLBACK_BUTTONS.iter().find(|&&(key, _)| key == vk).map(|&(_, mask)| mask)
+            };
+            let mut causes = Vec::new();
+            #[cfg(feature = "diagnostics")]
+            {
+                let keys = match device {
+                    0 => self.script_pad.as_slice(),
+                    KEYBOARD | FALLBACK => self.script_keys.as_slice(),
+                    _ => &[],
+                };
+                for &vk in keys {
+                    let id = if device == KEYBOARD { Some(u32::from(vk)) } else { mapped_key(vk) };
+                    if let Some(id) = id {
+                        causes.push(ButtonCause {
+                            id,
+                            key: Some(vk),
+                            phase: "scripted key",
+                        });
+                    }
+                }
+            }
+            for p in &latch.held {
+                let phase = if p.pause {
+                    "latch queue pause"
+                } else if p.replay {
+                    "latch queue"
+                } else if !latch.was.contains(&p.id) {
+                    "latch hold"
+                } else {
+                    continue;
+                };
+                let id = match device {
+                    KEYBOARD => p.id,
+                    FALLBACK => match mapped_key(p.id as u8) {
+                        Some(id) => id,
+                        None => continue,
+                    },
+                    _ => 1 << p.id,
+                };
+                causes.push(ButtonCause {
+                    id,
+                    phase,
+                    key: (device >= PADS).then_some(p.id as u8),
+                });
+            }
+            causes
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1790,6 +2019,64 @@ mod tests {
 #[cfg(test)]
 mod latch_tests {
     use super::*;
+
+    #[test]
+    fn idle_source_drops_the_queue_and_stops_buffering_until_a_look() {
+        for drop_stale in [true, false] {
+            let mut latch = Latch::default();
+            let start = Instant::now();
+            let mut sample = |down: &[u32], looks, ms| {
+                latch.sample(down, looks, start + Duration::from_millis(ms), drop_stale, 2)
+            };
+            for ms in [0, 20, 40] {
+                assert_eq!(sample(&[1], 0, ms), [1]);
+                assert_eq!(sample(&[], 0, ms + 8), [1]);
+            }
+            assert!(sample(&[], 0, 2000).is_empty());
+            // Legacy moves from pause to replay on the clock alone.
+            assert_eq!(sample(&[], 0, 4000).is_empty(), drop_stale);
+            if drop_stale {
+                assert_eq!(sample(&[1], 0, 4500), [1]);
+                assert!(sample(&[], 0, 4510).is_empty());
+                assert!(sample(&[], 1, 4520).is_empty());
+                assert_eq!(sample(&[1], 1, 4530), [1]);
+                assert_eq!(sample(&[], 1, 4540), [1]);
+                assert!(sample(&[], 3, 4600).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn queued_taps_expire_from_their_physical_edges_with_reads_in_progress() {
+        let mut latch = Latch::default();
+        let start = Instant::now();
+        let mut sample = |down: &[u32], looks, ms| {
+            latch.sample(down, looks, start + Duration::from_millis(ms), true, 2)
+        };
+        for ms in [0, 100, 120] {
+            assert_eq!(sample(&[1], 0, ms), [1]);
+            assert_eq!(sample(&[], 0, ms + 8), [1]);
+        }
+        assert!(sample(&[], 2, 1000).is_empty());
+        assert_eq!(sample(&[], 4, 1900), [1]);
+        // Replay began at 1900, but the physical press was at 100.
+        assert!(sample(&[], 4, 2100).is_empty());
+        // The second queued tap expires during the pause.
+        assert!(sample(&[], 6, 2120).is_empty());
+    }
+
+    #[test]
+    fn held_across_idle_gap_releases_immediately_and_a_new_tap_registers() {
+        let mut latch = Latch::default();
+        let t = Instant::now();
+        assert_eq!(latch.sample(&[1], 0, t, true, 2), [1]);
+        let resume = t + LATCH_MAX + POLL;
+        let mut reported = latch.sample(&[1, 2], 1, resume, true, 2);
+        reported.sort_unstable();
+        assert_eq!(reported, [1, 2]);
+        assert_eq!(latch.sample(&[], 1, resume + POLL, true, 2), [2]);
+        assert!(latch.sample(&[], 3, resume + POLL * 2, true, 2).is_empty());
+    }
 
     /// A tap that ends before the title looks is still reported, until the
     /// title has looked [`LATCH_LOOKS`] times.

@@ -101,6 +101,12 @@ removed, and the one change below that was inspired by XCL was written anew.
 | KyleS98 | gathered four translator fixes by DexNom and tjthebigbearcat-hub (credited in their own rows) | fork PR 1112 (`4bc83a69`, `20be56ab`, `ade7aa10`, `bed3396d`) |
 | Alexis | a texture refresh lets title memory move again once its bytes are copied (`VICTORY_TEXTURE_SHORT_HOLD`, off; ported) | fork PR 1078 (`4f83d40d`) |
 | beamdotdev | descriptor heap locks in pieces (`VICTORY_HEAP_LOCKS`); landed lists reset on a thread of their own (`VICTORY_LAND_ASIDE`, off) | fork PR 1146 (`6d1fe2f6`) |
+| nicolasveilleux | repeated output target bindings skipped (`VICTORY_REUSE_TARGET_BINDS`, off; ported) | fork PR 1215 (`e2bf384b`) |
+| Kyle Soderlund | card copies brought up to date in three batched steps (`VICTORY_CARD_SYNC_BATCH`; ported) | fork PR 1227 (`fe6d0f02`) |
+| UwUCammie | test of two card buffers and their piece hashes after one sync submission | fork PR 1227 (`1bb0e350`) |
+| spk | merged write intervals compacted in place (ported) | fork PR 1232 (`9a04be5a`) |
+| Kyle Soderlund | a thread remembers what its asks for a buffer's host copy found (`VICTORY_LOOKUP_CACHE`; ported) | fork PR 1237 (`cdf74b56`) |
+| fxceless | a list's fills of under 256 bytes copied in place (`VICTORY_FILLS_PLAIN`, off; ported) | fork main `de4146a0` |
 
 ## Geckomacabre/vx-layer
 
@@ -136,6 +142,8 @@ removed, and the one change below that was inspired by XCL was written anew.
 | EricPlayZ | fills of upload memory read together (`VICTORY_JOIN_FILLS`, hand port), port of PalmVIDev #229 and #245 | `e2328bed` |
 | commits authored "Claude" in that fork | `VICTORY_HEAP_PASS_UNMARKED`; `VICTORY_WRITE_ASIDE` and `VICTORY_ALIAS_LAZY` (hand port) | `64e58c46`; `2b64a9de`, `b9fe06d6`, `7e88d165` |
 | triippywhale/victory-fork | title copies go through the kernel when a remap races them (adapted) | `b0286796` |
+| triippywhale | landing-stage counters: where a landing's time goes and how long fence signals wait behind the copy-back (the counters only, ported) | `962e6af5` |
+| commits authored "Claude" in that fork | batch ownership of split source reads (a caller helps only with the jobs it queued), followed in `VICTORY_SPLIT_SOURCE` | `d51efcf8` |
 
 PalmVIDev's original work (#136, #223, #229, #245) reached this tree through
 triippywhale's fork; PalmVIDev's own repository no longer resolves.
@@ -183,6 +191,20 @@ constants; and four defect fixes found by an outside review (a later list of
 a submission waits for an earlier list's read-back; a boxed read-back writes
 back only the box; a fresh table holding constants is not reused across a
 title write; the present keeps the `VICTORY_BACK_SETTLE` policy).
+
+Written for this tree since the first snapshot: the hand ports of fork PRs
+1215, 1227, 1232 and 1237, fork main `de4146a0` and triippywhale `962e6af5`
+named above; title-memory copy costs (split source reads,
+`VICTORY_SPLIT_SOURCE`; the bound alias lookup, `VICTORY_BOUND_ALIAS_LOOKUP`;
+held asks skipped, `VICTORY_SKIP_HELD_ASK`; the source difference census,
+`VICTORY_SOURCE_DIFF`; and their five-second counters); four cuts in guard
+handling (`VICTORY_GUARD_DIRECT_OPEN`, `VICTORY_GUARD_REUSE_ARM`,
+`VICTORY_GUARD_BATCH_ALIAS`, `VICTORY_GUARD_HOT`) with their counters; the
+frame-end counters (`VICTORY_FRAME_END_WHY`) and a present that waits only
+for tagged read-backs (`VICTORY_LATE_WAIT=3`, `VICTORY_LATE_SET`); and input
+work: stale latched and queued presses dropped
+(`VICTORY_LATCH_DROP_STALE`), and a trace of the button edges the title is
+given (`VICTORY_INPUT_WHY`).
 
 Several contributors' own commits also say they were written with AI
 assistance (Claude Code, OpenAI Codex); commits in triippywhale's fork carry
