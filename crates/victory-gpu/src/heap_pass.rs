@@ -209,6 +209,59 @@ pub(crate) fn full_pass() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_PASS_FULL").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_HEAP_SAME_SKIP=1` (off by default): a due slot whose record is the one kept, whose host
+/// slot is made from it with its view still there
+/// (`HostHeap::made_from`), and whose kept host copy the tables still give
+/// for that copy's span (`shadow::still_found`) with the same table epoch is
+/// not looked at again: the look would find the same view, copy and
+/// range. (Self-marks and rewrites of the same record, some 15k slots a
+/// frame.) What the copy's bytes need is not the look's: every pass
+/// refreshes each kept copy's span (`Picked::spans`, then
+/// `Shadow::refresh`), looked at or not. Not with the old pass.
+pub(crate) fn same_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SAME_SKIP").is_some_and(|v| v == "1"))
+}
+
+/// `VICTORY_HEAP_SAME_SKIP_CHECK=<n>`: every n-th slot the skip would
+/// pass by is looked at all the same, and what the look finds (view's
+/// host copy and range) compared with what was kept; a difference is a
+/// mismatch, counted for the interval. 0 or unset: none.
+pub(crate) fn same_skip_check() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_HEAP_SAME_SKIP_CHECK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
+}
+
+/// Since the last line: slots skipped, due slots looked at, copies not
+/// still found (their slots not skipped), checks, check mismatches.
+pub(crate) static SAME_SKIP: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// With the frame-rate line, while [`same_skip`] is on.
+pub(crate) fn same_skip_line(frames: f64) {
+    if !same_skip() {
+        return;
+    }
+    let [skipped, due, moved, checks, mismatches] = SAME_SKIP.each_ref().map(|v| v.swap(0, Relaxed));
+    tracing::info!(
+        "heap same skip per frame (VICTORY_HEAP_SAME_SKIP=1): {:.1} due slots passed by of {:.1}, {:.1} kept copies \
+         not found again (their slots looked at); checks {checks}, check mismatches {mismatches} (interval totals)",
+        skipped as f64 / frames,
+        (skipped + due) as f64 / frames,
+        moved as f64 / frames,
+    );
+}
+
+/// A slot the skip passed by was looked at (`VICTORY_HEAP_SAME_SKIP_CHECK`):
+/// `kept` the copy key and range kept, `found` what the look found.
+pub(crate) fn same_skip_checked(kept: (usize, u64, u64), found: Option<(usize, u64, u64)>) {
+    SAME_SKIP[3].fetch_add(1, Relaxed);
+    if found != Some(kept) {
+        SAME_SKIP[4].fetch_add(1, Relaxed);
+    }
+}
+
 /// A slot's record in title memory: the tag and two words
 /// (`descriptor::record_at`).
 pub(crate) type Record = [u32; 3];
@@ -218,6 +271,7 @@ struct Slot {
     from: u64,
     to: u64,
     record: Record,
+    table_epoch: u64,
 }
 
 struct Copy<C> {
@@ -238,7 +292,7 @@ pub(crate) struct Picked<C> {
     orphans: HashMap<u32, Record>,
     /// View table entry -> slots whose record named it at their last look
     /// (some may name another by now: checked when used).
-    by_entry: HashMap<u32, Vec<u32>>,
+    by_entry: HashMap<u32, HashSet<u32>>,
     /// Table entries freed since the last pass; `None`: not known.
     forgotten: Option<Vec<u32>>,
     /// The old pass (`VICTORY_HEAP_PASS_FULL=1`).
@@ -472,10 +526,10 @@ impl<C: Clone> Picked<C> {
     /// Slot `slot` (with `record`, naming table entry `entry`) reads title
     /// memory `[from, to)` through host copy `copy` (`key`: its identity).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn keep(&mut self, slot: u32, key: usize, copy: &C, from: u64, to: u64, record: Record, entry: Option<u32>) {
+    pub(crate) fn keep(&mut self, slot: u32, key: usize, copy: &C, from: u64, to: u64, record: Record, entry: Option<u32>, table_epoch: u64) {
         self.forget(slot);
         self.note_entry(slot, entry);
-        self.slots.insert(slot, Slot { copy: key, from, to, record });
+        self.slots.insert(slot, Slot { copy: key, from, to, record, table_epoch });
         let c = self.copies.entry(key).or_insert_with(|| Copy {
             copy: copy.clone(),
             slots: HashSet::new(),
@@ -500,9 +554,27 @@ impl<C: Clone> Picked<C> {
         if let Some(e) = entry
             && !self.full
         {
-            // (Maybe twice: the pass's set of due slots takes it once.)
-            self.by_entry.entry(e).or_default().push(slot);
+            // Once: a slot looked at again every pass with the same entry
+            // was pushed again each time.
+            self.by_entry.entry(e).or_default().insert(slot);
         }
+    }
+
+    /// The host copy (its key) and range kept for slot `slot`, if a view
+    /// is kept for it (`VICTORY_FRAME_WHY2`'s count of slots looked at
+    /// again that resolve to the same).
+    pub(crate) fn kept(&self, slot: u32) -> Option<(usize, u64, u64, Record, u64)> {
+        self.slots.get(&slot).map(|s| (s.copy, s.from, s.to, s.record, s.table_epoch))
+    }
+
+    /// Each kept host copy: its key, the copy and its span so far.
+    pub(crate) fn kept_copies(&self) -> impl Iterator<Item = (usize, &C, u64, u64)> {
+        self.copies.iter().map(|(&key, c)| (key, &c.copy, c.from, c.to))
+    }
+
+    /// Whether this is the old pass (`VICTORY_HEAP_PASS_FULL=1`).
+    pub(crate) fn full(&self) -> bool {
+        self.full
     }
 
     /// The views kept.
@@ -584,7 +656,7 @@ mod tests {
             };
             let copy = slot / 4;
             let from = u64::from(slot) * 16;
-            p.keep(slot, copy as usize, &copy, from, from + 16, record, entry(record));
+            p.keep(slot, copy as usize, &copy, from, from + 16, record, entry(record), 0);
         }
         due
     }
@@ -593,6 +665,19 @@ mod tests {
         Heap {
             records: (0..n).map(|s| (s, [1, 100 + s, 1])).collect(),
         }
+    }
+
+    #[test]
+    fn a_slot_looked_at_again_is_noted_once_under_its_entry() {
+        let heap = heap(8);
+        let mut p = Picked::new(false);
+        pass(&mut p, &heap, vec![], vec![]);
+        for _ in 0..5 {
+            assert_eq!(pass(&mut p, &heap, vec![3], vec![]), vec![3]);
+        }
+        assert_eq!(p.by_entry[&103].len(), 1);
+        // The entry freed: the slot is looked at once.
+        assert_eq!(pass(&mut p, &heap, vec![], vec![103]), vec![3]);
     }
 
     #[test]
@@ -642,7 +727,7 @@ mod tests {
         let mut p: Picked<u32> = Picked::new(false);
         let _ = p.plan(vec![], || vec![0, 1, 2, 3], |s| heap.record(s), entry);
         for s in 0..3 {
-            p.keep(s, 0, &0, 0, 16, heap.record(s).unwrap(), None);
+            p.keep(s, 0, &0, 0, 16, heap.record(s).unwrap(), None, 0);
         }
         p.orphan(3, heap.record(3).unwrap(), None);
         for n in 1..FULL_EVERY {
@@ -705,7 +790,7 @@ mod tests {
                 continue;
             };
             let from = u64::from(slot) * 16;
-            p.keep(slot, (slot / 4) as usize, &(slot / 4), from, from + 16, record, entry(record));
+            p.keep(slot, (slot / 4) as usize, &(slot / 4), from, from + 16, record, entry(record), 0);
         }
         (due, reads.get())
     }

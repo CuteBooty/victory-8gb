@@ -1721,6 +1721,18 @@ impl HostHeap {
         self.count
     }
 
+    /// Whether host slot `index` is made from `record` already (its
+    /// [`HostHeap::made_now`] key) and the record's view is still there:
+    /// `mirror`'s path that does nothing (the heap pass).
+    pub(crate) fn made_from(&self, index: u32, record: [u32; 3]) -> bool {
+        let [tag, i, generation] = record;
+        let key = u64::from(generation) << 32 | u64::from(i);
+        tag == VIEW_TAG
+            && index < self.count
+            && self.made_now.get(index as usize).is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire) == key)
+            && view_at(i, generation).is_some()
+    }
+
     /// The dynamic slots past the title's (none in sampler heaps).
     pub(crate) fn dynamic_len(&self) -> u32 {
         self.dynamic
@@ -2193,7 +2205,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let kept = make(view, self.cpu(index));
+        let kept = make(view, self.cpu(index)).ok();
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
@@ -2403,6 +2415,12 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_checked(index, handle, for_draw).0
+    }
+
+    /// Also tells the indexed upload pass that this view still needs room
+    /// for its texture. The key of such a slot stays unset for the next use.
+    pub(crate) fn mirror_checked(&self, index: u32, handle: u64, for_draw: bool) -> (Option<View>, bool) {
         #[cfg(feature = "diagnostics")]
         {
             if !self.sampler {
@@ -2421,7 +2439,7 @@ impl HostHeap {
                     "title slot past the host heap"
                 );
             }
-            return None;
+            return (None, false);
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
@@ -2430,7 +2448,7 @@ impl HostHeap {
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         // Made from this record already: nothing to do, and no lock.
         if view.is_some() && heap_locks() && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == key {
-            return view;
+            return (view, false);
         }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let Some(view) = view else {
@@ -2445,8 +2463,9 @@ impl HostHeap {
                 // Left for later and stale since: out of the sets and the stride table.
                 let _ = self.note_buffer(index, None, false);
             }
-            return None;
+            return (None, false);
         };
+        let mut retry = false;
         if made[index as usize] != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
@@ -2478,14 +2497,16 @@ impl HostHeap {
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
+                return (Some(view), false);
             }
-            made[index as usize] = if later { 0 } else { key };
             let kept = if later {
                 None
             } else {
-                make(&view, self.cpu(index))
+                let result = make(&view, self.cpu(index));
+                retry = matches!(result, Err(crate::resource::NoTexture::ForNow));
+                result.ok()
             };
+            made[index as usize] = if later || retry { 0 } else { key };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
@@ -2494,7 +2515,7 @@ impl HostHeap {
             // record as made only once it is.
             self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
-        Some(view)
+        (Some(view), retry)
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
@@ -3216,9 +3237,24 @@ fn raw_srv(buffer: &ID3D12Resource, offset: u64, len: u64, at: D3D12_CPU_DESCRIP
     Some(())
 }
 
-/// Makes the host descriptor for `view` at `at`: the host resource it
-/// views, or `None` if it cannot.
-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+/// Makes the host descriptor for `view` at `at`, preserving a transient
+/// creation failure so the caller can leave the slot due.
+fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Result<Kept, crate::resource::NoTexture> {
+    use crate::resource::NoTexture;
+    let placed = placed_texture(view);
+    let view = placed.as_ref().unwrap_or(view);
+    let texture = match view {
+        View::Shader(r, _) | View::Unordered(r, _, _) => match crate::resource::try_host_resource(*r as crate::object::This) {
+            Ok(texture) => Some(texture),
+            Err(NoTexture::ForNow) => return Err(NoTexture::ForNow),
+            Err(NoTexture::Refused) => None,
+        },
+        _ => None,
+    };
+    make_view(view, at, texture).ok_or(NoTexture::Refused)
+}
+
+fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, texture: Option<&ID3D12Resource>) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
@@ -3236,7 +3272,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Shader(resource, desc) => {
             let resource = *resource as crate::object::This;
-            if let Some(texture) = crate::resource::host_resource(resource) {
+            if let Some(texture) = texture {
                 // The title's views of textures with a stencil plane, as it
                 // describes them (format, dimension, component mapping, a
                 // pad, then first level, levels, plane): each distinct one
@@ -3287,7 +3323,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Unordered(resource, _counter, desc) => {
             let resource = *resource as crate::object::This;
-            let Some(texture) = crate::resource::host_resource(resource) else {
+            let Some(texture) = texture else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
                         buffer_uav(data as u64, len, uav_desc(desc), at)
@@ -3358,9 +3394,6 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
-            if let Some(view) = placed_texture(view) {
-                return make(&view, at);
-            }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
                 // shortcut: unordered access to a texture the title placed

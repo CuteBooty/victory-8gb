@@ -347,7 +347,7 @@ fn worker() {
     let Some(job) = JOB.get() else {
         return;
     };
-    // A lane of its own in `VICTORY_FRAME_WHY2`'s timeline (lab-v8a-s).
+    // A lane of its own in `VICTORY_FRAME_WHY2`'s timeline.
     crate::frame_why::role(crate::frame_why::Role::Heap);
     loop {
         let waiting = crate::frame_why::span(crate::frame_why::Phase::Idle);

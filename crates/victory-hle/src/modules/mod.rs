@@ -58,6 +58,10 @@ pub(crate) fn all() -> Vec<HleModule> {
         xg::module(),
     ];
     #[cfg(windows)]
+    if victory_gpu::cores::places_titles() {
+        all.push(kernel::thread_module());
+    }
+    #[cfg(windows)]
     all.push(apu::module());
     #[cfg(windows)]
     all.push(media::module());

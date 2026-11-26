@@ -19,27 +19,37 @@ publisher or the console maker. Licensed GPL-3.0-or-later; built with AI
 assistance. See [CREDITS.md](CREDITS.md), [CONTRIBUTING.md](CONTRIBUTING.md)
 and [AGENTS.md](AGENTS.md).
 
-## Test machine and status (measured 2026-11-25)
+## First launch
+
+On an empty shader cache the first launch plays the audio and shows the
+credit titles, but the 3D scenes stay **black for about 10-12 minutes** while
+about 2,900 pipelines are built. Measured once on the test machine below: a
+picture after about 10 minutes, the queue empty after 12. In that time some
+green static and a short hang with a loading wheel were also seen.
+
+What to do: let the opening scene play through once without pressing anything
+to skip it, then close the game and start it again. (`VICTORY_SKIP_BINK=1`
+from the table below only skips the pre-rendered movies; the opening scene
+meant here is drawn by the game and still plays.) On the second launch the opening scene has a picture
+from the first moment (tested once: 2,847 cache hits, 2 misses).
+
+The opening cutscene itself is slow (about 2 fps reported). Play gets faster
+once you are in control (the bunk room at about 180 ms a frame).
+
+## Test machine and status (measured 2026-11-25 and 2026-11-26)
 
 Windows 11, NVIDIA RTX 3070 8 GB (driver 621.24), AMD Ryzen 5 3600 (6 cores /
 12 threads), 32 GB RAM; the title's Series S mode at 1920x1080 output, with the
-switches in the table below.
+switches in the table below. One PC; your numbers will differ.
 
-- The first story mission was played from start to end in one 103-minute run
-  without a crash; a manual save was written and loaded again (on an earlier
-  build of this tree).
-- Frame times, as medians of the 5-second log lines: open water about
-  141-168 ms (6-7 fps); medium scenes with 4,400-7,000 draws 180-250 ms;
-  heavy scenes (town, dense foliage, 7,000-10,000 draws) 240-340 ms (3-4 fps).
-- The newest build has had seven short runs, without a crash or an error. The
-  best of them (about ten minutes in town with the switches in the table below,
-  no screen recorder): 154 ms at 3,000-5,000 draws, 187 ms at 5,000-7,000,
-  223 ms at 7,000-9,000 and 228 ms above 9,000; none of its 88 samples was
-  over 350 ms. One run, and not a heavy session.
-- Runs of 2026-11-26 with the same switches, by draw count: 155-163 ms at
-  3,000-5,000 draws, 184-203 ms at 5,000-7,000, 201-214 ms at 7,000-9,000.
-  Different places and different play (walking, driving, swimming), so these
-  are a range and not a comparison.
+- Longest session: 104 minutes on 2026-11-25, without a crash and with 0
+  logged errors; the first Chapter I mission was played through and saved by
+  hand.
+- 2026-11-26: 34 runs, 0 logged errors, no device loss, no crash.
+- Frame times of 2026-11-26 with the recommended set, as medians of the log's
+  5-second lines by draws per frame: 1,000-3,000 draws about 120-130 ms;
+  5,000-7,000 about 205-210 ms; 7,000-9,000 about 220-240 ms; 9,000-11,000
+  about 230-280 ms. On this machine the dense frame is mostly CPU time.
 
 ## New in the first snapshot (compared with the fork it is based on)
 
@@ -266,9 +276,45 @@ What the same night showed without a code change:
   fork) was run by others on the fork's own code: remapping 42.8 to 5.0 ms
   a frame on an RTX 3080, no change in frame rate there.
 
+## What changed since the fifth snapshot
+
+Everything new here is behind a switch that is off unless stated, so without
+switches the tree behaves as the fifth snapshot did, except for the changes
+marked "always on" or "on". Sources are in CREDITS.md.
+
+- **Gather segments** (`VICTORY_GATHER_SEGMENTS=1`, with
+  `VICTORY_INDIRECT_GATHER=1`): once a list stops gathering its single
+  indirect records, later records are clamped in segments, one pass each, so
+  they no longer fall back to a pass per record. The clamp shader takes its
+  record count from a counted table.
+- **Indirect records the title can still change are clamped at the draw**
+  (`VICTORY_GATHER_STRICT`, on): a gathered record whose source may be
+  written before the draw falls back to a pass in front of that draw.
+- **Textures the card had no room for are tried again after a second**
+  (`VICTORY_TEXTURE_ROOM_RETRY`, on), at most `VICTORY_TEXTURE_ROOM_RETRY_PER_S`
+  a second; before, such a texture was refused for the whole run.
+- **A texture that a placed view aliases is held while a copy uses it**
+  (always on): before, the copy could keep a bare pointer to a texture that
+  was released under it.
+- **BCPack (BC7) rotation only in modes 4 and 5** (always on): blocks of the
+  other modes were decoded with swapped channel precisions.
+- Texture rechecks: periodic (`VICTORY_HEAP_RECHECK_EVERY`) and, after a
+  change, in the next frame (`VICTORY_RECHECK_SOON`).
+- More `VICTORY_FRAME_WHY2` lines and a set of experiments for the CPU side
+  of the frame (guard lock, write watch, heap pass, queues, thread placement,
+  ambient light), all off; see the switch table.
+
 ## Known problems
 
 - Slow (see the frame times above).
+- Occasionally a single object or face shows a black texture that pops in
+  and out.
+- Flat lighting, most visible at dusk and indoors: the title's ray-traced
+  bounce light does not run on 32-lane cards, and `VICTORY_AMBIENT` is only a
+  fill light.
+- Once, on the very first launch, one NPC's face was missing; it was there
+  after the restart.
+- The opening cutscene runs at about 2 fps (see "First launch").
 - The picture's exposure flashes when submissions are in flight across the
   present (`VICTORY_LATE_WAIT` unset with the relay on). The recommended
   `VICTORY_LATE_WAIT=2` lets everything land before the present returns; the
@@ -293,8 +339,8 @@ What the same night showed without a code change:
   works.
 - Eight compute programs are refused by the translator.
 - No autosave was seen during a mission.
-- The first launch after a change to the shader translator translates every
-  shader again (about 20 minutes on the test machine).
+- The first launch on an empty shader cache, and the first after a change to
+  the shader translator, builds every pipeline again (see "First launch").
 - Many changes here are specific to this title, and some are marked
   `shortcut:` in the code where they approximate what the console does.
 - A few style lints are switched off in the workspace `Cargo.toml` until the
@@ -307,7 +353,9 @@ in a comment where the code reads it.
 
 | Switch | What it does |
 |---|---|
-| `VICTORY_SKIP_BINK=1` | skips the title's movies that play once (the intro); `=all` also skips looping ones |
+| `VICTORY_SHADER_LOOP_LIMIT=256` | translated shader loops stop after 256 iterations per lane instead of 2^20; every number in this README was measured with it (it has its own shader cache entries) |
+| `VICTORY_DISPLAY_MODE=1920x1080` | the display size the console reports; all runs here used it |
+| `VICTORY_SKIP_BINK=1` | skips the title's pre-rendered movies that play once (logos and the intro movie); `=all` also skips looping ones |
 | `VICTORY_TEXTURE_DROP_MIPS=1` | host copies of 2D textures the title fills (at least 512 texels on the shorter side) leave out their largest mip level, about three quarters of their bytes; shaders see them at half size |
 | `VICTORY_SMALL_TEXTURE_KB=0` | turns off letting small textures (up to 1024 KB by default, within a 384 MB reserve) onto a card that is out of room; with `0` they are refused while the card is full, as before |
 | `VICTORY_QUEUE2=1` | the relay's fetches of card copies run on a dedicated D3D12 copy queue (same as `VICTORY_RELAY_COPY_QUEUE=1`); pieces fetched beside a later flight are fetched again by it. Ignored with `VICTORY_CARD_FETCH_INFLIGHT=1` |
@@ -363,7 +411,7 @@ Defaults as the code reads them. "On" switches are turned off with `=0`;
 | `VICTORY_BACK_LATCH` | off | 5-second counters of how old read-backs are when the present returns (diagnostic; changes no behaviour) |
 | `VICTORY_AMBIENT` | off | a constant least amount of indirect light in place of the title's bounced light; `=<level>` sets it (0.6 recommended, `0` is none, an unreadable value means 0.6) |
 | `VICTORY_RAW_VIEW_CLAMP` | on | a raw buffer view stays inside its buffer: a range past the end is shortened to the whole dwords that fit, an unaligned or empty one becomes a null view; `0`: the old descriptors, and no counting |
-| `VICTORY_FRAME_WHY2` | off | 5-second lines beginning `why2`: queries, culling dispatches, the title's and the worker's timelines, descriptor work by cause (diagnostic; changes no behaviour) |
+| `VICTORY_FRAME_WHY2` | off | 5-second lines beginning `why2`: queries, culling dispatches, the title's and the worker's timelines, descriptor work by cause; since the fifth snapshot also settle causes, heap-slot counts, submit worker idle time and guard-lock hold durations (diagnostic; changes no behaviour; the timeline is approximate relay observations, not exact frame attribution) |
 | `VICTORY_UPSCALE_HISTORY` | off | Series S: blends each stretched frame with the previous ones before the interface is drawn; `=<blend>` from 0 to 1 is the most weight history may have (0.9 with `_MV=2`, 0.5 with `_MV=1`) |
 | `VICTORY_UPSCALE_HISTORY_MV` | off | `1`: history clamped to the current 3x3 colour range; `2`: history follows the title's motion vectors, with depth and colour rejection and a weight per pixel |
 | `VICTORY_HEAP_WORKER` | off | the texture part of the descriptor heap pass runs on a thread of its own (needs `VICTORY_LATE_WAIT`); textures can show a frame late |
@@ -372,6 +420,40 @@ Defaults as the code reads them. "On" switches are turned off with `=0`;
 | `VICTORY_WATCH_SPLIT` | off | the kernel's write-watch query runs under per-region locks instead of the journal's lock |
 | `VICTORY_DESC_DIRTY` | off | `1`: descriptor records on pages not written since the last pass are not compared (write-watched memory only); `2`: also guarded view memory (not yet run); `VICTORY_DESC_DIRTY_CHECK=<n>` samples skipped ranges |
 | `VICTORY_SAMPLER_HEAP_FULL` | off | host sampler heaps are made with 2,048 slots, the last a null sampler (not yet run) |
+| `VICTORY_INDIRECT_GATHER` | off | experimental, `=1`: single indirect records that miss their window are clamped together in their list's prelude (needs `VICTORY_INDIRECT_WINDOW=1`). Measured 237 -> 218 ms at 7,000-9,000 draws before the safety rule below; with `VICTORY_GATHER_STRICT` about half the records fall back and most of the card saving is lost (220 ms in one run) |
+| `VICTORY_GATHER_STRICT` | on | with gather, a record whose source can still change under the card (in-place arguments, or a copy not on the card while submissions are in flight) is clamped at its draw instead; `=0` gathers them anyway (unsafe) |
+| `VICTORY_GATHER_SEGMENTS` | off | experimental, `=1` (`=alt` in turns), needs gather: after a list stops gathering, records are clamped in segments, one pass each; removes the "list had stopped gathering" fallbacks; no frame gain shown on this CPU |
+| `VICTORY_TEXTURE_ROOM_RETRY` | on | a texture the card had no room for is tried again after a second instead of being refused for the run, at most `VICTORY_TEXTURE_ROOM_RETRY_PER_S` (default 8) a second; `=0` restores the old way. Not yet exercised in our runs |
+| `VICTORY_MERGE_CAP` | 512 | `=<runs>`: the most changed runs merged beside flights' writes in a submission before it settles instead |
+| `VICTORY_RECHECK_SOON` | off | a texture picked by index that changed after its upload is looked at again in the next frame, not four frames later |
+| `VICTORY_HEAP_RECHECK_EVERY` | off | `=<frames>`: uploaded textures picked by index are looked at again every that many frames |
+| `VICTORY_STANDING_SKIP` | off | experimental: refreshes the submission's standing write-watch asking vouches for are skipped; its self-check had one unexplained mismatch |
+| `VICTORY_PORT_GUARD` | off | experimental: the guards' lock is shared, with per-block claims (not with `VICTORY_GUARD_HOT`) |
+| `VICTORY_GUARD_CHUNK` | off | experimental, `=<blocks>` (64 suggested): a guarding lets go of the guards' lock between chunks |
+| `VICTORY_VIEW_KNOWN` | off | experimental: view memory the guards once found is left out of the kernel's write-watch askings |
+| `VICTORY_WAKE_FIRST` | off | experimental: the queues are woken before the landed lists are reset |
+| `VICTORY_PRESENT_FLIGHT` | off | experimental: at `VICTORY_LATE_WAIT=2` the present's copy goes to the card as a flight of its own |
+| `VICTORY_HEAP_SAME_SKIP` | off | experimental: the heap pass passes by due slots that would find what was kept (`_CHECK=<n>` samples them) |
+| `VICTORY_CORE_PLAN` | off | experimental, `=ours-a`, `ours-b`, `split`, `title-a` or `together`: threads placed on one of two comparable last-level cache groups (CPU sets); `VICTORY_CORE_HARD=1` uses a hard affinity mask instead |
+| `VICTORY_AMBIENT_SKY` | off | experimental, `=1` (or `gain,least[,power]`): the fill light follows the sky's brightness |
+| `VICTORY_AMBIENT_REFLECT` | off | experimental, `=<part>`: reflections held to that part of the light around |
+| `VICTORY_SAME_RECORDS` | off | experimental: descriptor records copied onto the same bytes are not written |
+| `VICTORY_DECLARE_ONCE` | off | experimental: a shader-write declaration repeated within a list is recorded once until the list next writes title memory |
+| `VICTORY_RUNS_AVX2` | unset | experimental, `=1`: the changed runs under flights' writes found 32 bytes at a time with AVX2 (same runs); `=0` the old compare, timed |
+
+## Send us numbers
+
+Everything above was measured on one PC. Testers with 8 GB cards or older
+CPUs are wanted. Please send:
+
+- GPU, CPU, RAM, and the console profile (Series S or X);
+- the exact switch set you ran with;
+- from one five-minute run with `VICTORY_FRAME_WHY2=1`, the output of
+  `perl tools/bands.pl <log>` (frame, preparing and GPU time by draws per
+  frame) and `perl tools/timeline.pl <log>` (the frame's timeline from the
+  present call, by draws per frame).
+
+Contributions are welcome, especially on the CPU side of the frame.
 
 ## Building
 

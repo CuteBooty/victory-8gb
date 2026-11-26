@@ -272,6 +272,44 @@ pub(crate) fn refreshes(jobs: Vec<Job>) -> u64 {
     started.elapsed().as_micros() as u64
 }
 
+/// `items` without those `keep` says no to, in their order; `keep` runs on
+/// the threads, the items cut in one piece per thread (on this thread
+/// alone for fewer than two). Returns the kept items and the microseconds
+/// it took.
+///
+/// For a flush's look at which refreshes copy nothing
+/// (`Shadow::nothing_new`, `Batch::flush`): done on the submitting thread
+/// alone it was up to 6 ms a submission with the threads beside it idle
+/// (after avatarmanz's renderer port 6, 00ab2acf). The answers are the
+/// same as on one thread: each look reads its own copy's notes and the
+/// journal, and writes only counters; the write-watch asking ahead is made
+/// after all of them, for the kept ones, as before.
+pub(crate) fn filter<T: Send + 'static>(items: Vec<T>, keep: fn(&mut T) -> bool) -> (Vec<T>, u64) {
+    let started = Instant::now();
+    if items.len() < 2 {
+        let mut items = items;
+        items.retain_mut(keep);
+        return (items, started.elapsed().as_micros() as u64);
+    }
+    let pieces = threads().clamp(2, MOST).min(items.len());
+    let per = items.len().div_ceil(pieces);
+    let out: Arc<Vec<Mutex<Vec<T>>>> = Arc::new((0..pieces).map(|_| Mutex::new(Vec::new())).collect());
+    let mut rest = items;
+    let mut group = Group::default();
+    for slot in 0..pieces {
+        let tail = rest.split_off(per.min(rest.len()));
+        let mut piece = std::mem::replace(&mut rest, tail);
+        let out = out.clone();
+        group.spawn(Box::new(move || {
+            piece.retain_mut(keep);
+            *lock(&out[slot]) = piece;
+        }));
+    }
+    group.join();
+    let kept = out.iter().flat_map(|piece| std::mem::take(&mut *lock(piece))).collect();
+    (kept, started.elapsed().as_micros() as u64)
+}
+
 /// The line on the frame line's beat; `frames` since the last.
 pub(crate) fn line(frames: f64) {
     let [parallel, single, jobs, work, wall, longest, one_copy, no_threads, kept, upfront_us, passes] =
@@ -428,6 +466,20 @@ mod tests {
                 .collect();
             refreshes(jobs);
             assert_eq!(done.load(SeqCst), n);
+        }
+    }
+
+    #[test]
+    fn filter_keeps_the_serial_answer_in_order() {
+        fn odd(v: &mut usize) -> bool {
+            *v % 2 == 1
+        }
+        for n in [0usize, 1, 2, 3, 7, 100, 1001] {
+            let items: Vec<usize> = (0..n).collect();
+            let mut want = items.clone();
+            want.retain_mut(odd);
+            let (got, _) = super::filter(items, odd);
+            assert_eq!(got, want, "{n} items");
         }
     }
 

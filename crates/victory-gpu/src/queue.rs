@@ -151,6 +151,7 @@ fn forces() -> bool {
 #[cfg(windows)]
 fn submit_cut(this: This, lists: &[This]) {
     let _submit = crate::frame_why::span(crate::frame_why::Phase::SubmitCall);
+    let _enqueue = crate::why_more::enqueue();
     let Some(host) = crate::host::host() else {
         return;
     };
@@ -440,6 +441,7 @@ fn wake(prepared: Option<Prepared>) {
 fn worker() {
     crate::frame_why::role(crate::frame_why::Role::Submit);
     let mut waiting = Vec::new();
+    crate::cores::worker("victory-submit");
     loop {
         {
             let mut work = lock(&WORK.0);
@@ -982,6 +984,7 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    crate::why_more::present_call();
     let drain = crate::frame_why::drain();
     #[cfg(windows)]
     crate::host::back_age::begin_present();
@@ -1148,10 +1151,12 @@ extern "system" fn present(
     #[cfg(windows)]
     if crate::host::back_age::enabled() {
         crate::host::back_age::end_present(&PRESENTS_DONE);
+        crate::why_more::present_return();
         crate::frame_why::frame();
         return S_OK;
     }
     PRESENTS_DONE.fetch_add(1, Ordering::Release);
+    crate::why_more::present_return();
     crate::frame_why::frame();
     S_OK
 }

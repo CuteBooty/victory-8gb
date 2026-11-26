@@ -726,6 +726,24 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Frames between looks at an uploaded texture picked by index once
+/// [`RECHECK_FRAMES`] is through (`VICTORY_HEAP_RECHECK_EVERY=<frames>`;
+/// unset or 0: it is not looked at again, as before). The title streams a
+/// texture's memory in and rewrites it long after its view was written:
+/// what changes after the schedule's last look stays as it was on the card
+/// for the rest of the run. Ported by hand from fxceless/victory-fork
+/// e4245f3c (fxceless; after RyanCase94's 920423a9).
+fn recheck_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let every = std::env::var("VICTORY_HEAP_RECHECK_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if every > 0 {
+            tracing::info!("uploaded textures picked by index are looked at again every {every} frames (VICTORY_HEAP_RECHECK_EVERY)");
+        }
+        every
+    })
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -789,6 +807,23 @@ fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
 }
+
+/// Whether a texture picked by index that a look found changed after its
+/// upload is looked at again in the next frame, not after
+/// `RECHECK_FRAMES[0]` (`VICTORY_RECHECK_SOON=1`; off by default). A
+/// texture whose bytes land in several pieces, or that the title keeps
+/// writing, was shown four frames behind at each change. Ported from
+/// fxceless's fork main 06702fe8 (the AMD sibling repository's switch of
+/// that name, on by default there).
+fn recheck_soon() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_some_and(|v| v == "1"))
+}
+
+/// Uploads of textures picked by index looked at again in the next frame
+/// because a look had found them changed ([`recheck_soon`]), since the
+/// start.
+pub(crate) static HEAP_TEXTURES_SOON: AtomicU64 = AtomicU64::new(0);
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -1300,6 +1335,16 @@ impl State {
         }
         if !self.bind(list, p, false) {
             return false;
+        }
+        // The sky as the title reflects it: with `VICTORY_AMBIENT_SKY` the
+        // least indirect light follows it (`crate::ambient`; after Belobug's
+        // VIctory-Belobug-AMD).
+        if crate::ambient::level().is_some()
+            && crate::ambient::follow().is_some()
+            && p.stages.iter().any(|s| s.shader.draws_sky)
+            && let Some(&sky) = self.targets.first()
+        {
+            crate::ambient::sky_drawn(sky);
         }
         let l = &list.list;
         // Vertex buffers the input layout reads.
@@ -1924,6 +1969,7 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
+        let why_started = crate::why_more::heap_pass_begin();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots marked since the
         // last pass are looked at again (`crate::heap_pass`: written, their
@@ -1977,13 +2023,51 @@ impl State {
         // With VICTORY_HEAP_PASS_UNMARKED=1, the slots the looks below make
         // are not marked for the next pass.
         let passing = crate::descriptor::host::passing();
+        // `VICTORY_HEAP_SAME_SKIP=1`: the kept copies the tables no longer
+        // give for their span; their slots are looked at.
+        let same_skip = crate::heap_pass::same_skip() && !ranges.full();
+        let moved: std::collections::HashSet<usize> = if same_skip {
+            ranges
+                .kept_copies()
+                .filter(|&(_, copy, from, to)| !crate::shadow::still_found(copy, from, to - from))
+                .map(|(key, ..)| key)
+                .collect()
+        } else {
+            Default::default()
+        };
+        let skip_check = crate::heap_pass::same_skip_check();
+        let mut skip_stats = [0u64; 2];
         for (n, &index) in slots.iter().enumerate() {
-            ranges.forget(index);
+            // (`VICTORY_FRAME_WHY2`: does it resolve to what was kept?)
+            let was = (why_started.is_some() || same_skip).then(|| ranges.kept(index)).flatten();
             let Some(handle) = heap.handle(index) else {
+                ranges.forget(index);
                 continue;
             };
             // Read before the slot is made: a write after it is seen next pass.
             let record = crate::descriptor::record_at(handle);
+            let same = was.is_some_and(|w| w.3 == record) && host.made_from(index, record);
+            if why_started.is_some() {
+                crate::why_more::heap_record(same);
+            }
+            // Stamp the slot before lookup. A new overlapping buffer can change
+            // its answer even when the aggregate span still finds the old copy.
+            let table_epoch = if same_skip { crate::shadow::table_epoch() } else { 0 };
+            if let Some(w) = was.filter(|w| same && same_skip && w.4 == table_epoch && !moved.contains(&w.0)) {
+                skip_stats[0] += 1;
+                if skip_check == 0 || !skip_stats[0].is_multiple_of(skip_check) {
+                    // As kept: the look would find the same.
+                    continue;
+                }
+                let found = host
+                    .mirror(index, handle, true)
+                    .and_then(|view| crate::descriptor::host::buffer_copy(&view))
+                    .map(|(shadow, address, len)| (std::sync::Arc::as_ptr(&shadow) as usize, address, address + len));
+                crate::heap_pass::same_skip_checked((w.0, w.1, w.2), found);
+            } else if same_skip {
+                skip_stats[1] += 1;
+            }
+            ranges.forget(index);
             let entry = crate::descriptor::record_entry(record);
             let Some(view) = host.mirror(index, handle, true) else {
                 continue;
@@ -2019,9 +2103,19 @@ impl State {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
-            ranges.keep(index, key, &shadow, address, address + len, record, entry);
+            if why_started.is_some() {
+                crate::why_more::heap_slot(was.is_some(), was.is_some_and(|w| (w.0, w.1, w.2) == (key, address, address + len)));
+            }
+            ranges.keep(index, key, &shadow, address, address + len, record, entry, table_epoch);
         }
         drop(passing);
+        if same_skip {
+            use crate::heap_pass::SAME_SKIP;
+            // (A checked slot counts as passed by: the skip would have.)
+            SAME_SKIP[0].fetch_add(skip_stats[0], Ordering::Relaxed);
+            SAME_SKIP[1].fetch_add(skip_stats[1], Ordering::Relaxed);
+            SAME_SKIP[2].fetch_add(moved.len() as u64, Ordering::Relaxed);
+        }
         let views = ranges.views() as u32;
         let looked = started.elapsed();
         // Per host copy, the span its picked views cover.
@@ -2068,6 +2162,7 @@ impl State {
             Self::heap_textures(TexturesInto::List(list), heap, host);
         }
         let all = started.elapsed();
+        crate::why_more::heap_pass_end(why_started);
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(all.as_micros() as u64, Ordering::Relaxed);
         for (part, micros) in HEAP_PASS_MICROS.iter().zip([looked, refreshed - looked, all - refreshed]) {
@@ -2574,6 +2669,9 @@ impl State {
             // the start of each mip of each slice (`texture::fingerprint`);
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            // One found changed by such a look is looked at again in the
+            // next frame with `VICTORY_RECHECK_SOON=1` ([`recheck_soon`]).
+            let mut again_in = RECHECK_FRAMES[0];
             if let Some(((at, len, print, looks, uploaded), mips)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len, mips.as_deref().unwrap_or_default()) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
@@ -2581,9 +2679,18 @@ impl State {
                         Some(wait) => {
                             host.texture_slot_recheck(index, write, frame + wait, (at, len), mips, print, looks + 1, uploaded)
                         }
-                        None => host.texture_slot_done(index, write, None),
+                        // The schedule is over: looked at again every so
+                        // many frames for as long as the slot shows it
+                        // (`recheck_every`), or never again.
+                        None => match recheck_every() {
+                            0 => host.texture_slot_done(index, write, None),
+                            every => host.texture_slot_recheck(index, write, frame.saturating_add(every), (at, len), mips, print, looks, uploaded),
+                        },
                     }
                     continue;
+                }
+                if recheck_soon() {
+                    again_in = 1;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
@@ -2594,6 +2701,7 @@ impl State {
                         frames_after_upload = frame.saturating_sub(uploaded),
                         looks,
                         changed = n + 1,
+                        looked_at_next_frame = HEAP_TEXTURES_SOON.load(Ordering::Relaxed),
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
                 }
@@ -2691,10 +2799,14 @@ impl State {
                     host.mirror(index, handle, true);
                 }
             };
-            let view = match &into {
-                TexturesInto::List(_) => heap.handle(index).and_then(|handle| host.mirror(index, handle, true)),
-                TexturesInto::Ahead(_) => record.as_ref().map(|(view, _)| view.clone()),
+            let (view, retry) = match &into {
+                TexturesInto::List(_) => heap.handle(index).map_or((None, false), |handle| host.mirror_checked(index, handle, true)),
+                TexturesInto::Ahead(_) => (record.as_ref().map(|(view, _)| view.clone()), false),
             };
+            if retry {
+                host.texture_slot_later(index, write, frame, most);
+                continue;
+            }
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -2704,7 +2816,14 @@ impl State {
                     continue;
                 }
             };
-            let title_fills = crate::resource::host_resource(resource).is_some_and(crate::texture::title_written);
+            let title_fills = match crate::resource::try_host_resource(resource) {
+                Ok(texture) => crate::texture::title_written(texture),
+                Err(crate::resource::NoTexture::ForNow) => {
+                    host.texture_slot_later(index, write, frame, most);
+                    continue;
+                }
+                Err(crate::resource::NoTexture::Refused) => false,
+            };
             // Its host copy is made now: it holds the room promised it
             // while it lives (else the promise is given back on `continue`).
             if let Some(small) = small.take()
@@ -2792,7 +2911,10 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len, mips)) => {
                     let print = crate::texture::fingerprint(at, len, mips.as_deref().unwrap_or_default());
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), mips, print, 0, frame);
+                    if again_in != RECHECK_FRAMES[0] {
+                        HEAP_TEXTURES_SOON.fetch_add(1, Ordering::Relaxed);
+                    }
+                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), mips, print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -2915,7 +3037,11 @@ impl State {
     /// After a dispatch of `p`: the least indirect light, if it is the
     /// program that resolves that (after Belobug/VIctory-Belobug-AMD).
     fn ambient(&self, list: &HostList, p: &crate::pipeline::host::HostPipeline) -> bool {
-        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+        let Some(stage) = p
+            .stages
+            .first()
+            .filter(|s| s.shader.resolves_light || (s.shader.ends_reflections && crate::ambient::reflections_held()))
+        else {
             return false;
         };
         let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
@@ -2929,6 +3055,14 @@ impl State {
             };
             crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
         };
+        if !stage.shader.resolves_light {
+            // The reflections, held to the light around
+            // (`VICTORY_AMBIENT_REFLECT`; after Belobug's VIctory-Belobug-AMD).
+            return match view(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some(View::Unordered(r, ..)) if r != 0 => crate::ambient::hold(list, r as This),
+                _ => false,
+            };
+        }
         let light = match view(ResourceType::Uav, crate::ambient::LIGHT) {
             Some(View::Unordered(r, ..)) => r,
             _ => 0,
@@ -3390,6 +3524,19 @@ impl State {
             .map(|u| u.slot)
             .collect();
         fresh.dedup();
+        // `VICTORY_FRAME_WHY2`: why each fresh table is
+        // fresh, by root parameter (`crate::why_more`'s cause bits).
+        let why_on = crate::frame_why::enabled();
+        let mut why_fresh: Vec<(u8, u8)> = Vec::new();
+        let mut why = |slot: u8, bit: u8| match why_fresh.iter_mut().find(|e| e.0 == slot) {
+            Some(e) => e.1 |= bit,
+            None => why_fresh.push((slot, bit)),
+        };
+        if why_on {
+            for &slot in &fresh {
+                why(slot, crate::why_more::CBV_COPIED);
+            }
+        }
         // The view shown in place of the title's at dword `at` of the table
         // in root parameter `slot`, if the shader moves halves there and
         // the title's view is a 16-bit float or signed buffer view.
@@ -3410,6 +3557,9 @@ impl State {
                 continue;
             };
             if crate::descriptor::host::half_view(&view).is_some() {
+                if why_on {
+                    why(slot, crate::why_more::HALF);
+                }
                 if !fresh.contains(&slot) {
                     fresh.push(slot);
                 }
@@ -3424,7 +3574,8 @@ impl State {
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            // (Looked at for the count too when fresh already.)
+            if fresh.contains(&u.slot) && !why_on {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -3438,7 +3589,12 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                if why_on {
+                    why(u.slot, crate::why_more::PAST_MIRROR);
+                }
+                if !fresh.contains(&u.slot) {
+                    fresh.push(u.slot);
+                }
             }
         }
         fresh.sort_unstable();
@@ -3534,8 +3690,8 @@ impl State {
                 }
                 (table, start, end, h.finish())
             };
-            // (Review of 2026-11-25, item 4: the constants filled
-            // for an earlier draw predate a title write since.)
+            // Constants filled
+            // for an earlier draw predate a subsequent title write.
             use crate::frame_why::{self, Count};
             let previous = if frame_why::enabled() {
                 frame_why::count(Count::Hash, 1);
@@ -3639,6 +3795,8 @@ impl State {
                     Some(_) => Count::Uncached,
                 };
                 frame_why::count(reason, 1);
+                let causes = why_fresh.iter().find(|e| e.0 == slot).map_or(0, |e| e.1);
+                crate::why_more::fresh_table(causes, n);
             }
             #[cfg(feature = "diagnostics")]
             {
@@ -4093,16 +4251,17 @@ impl State {
             && max == 1
             && count.is_none()
             && !p.stages.iter().any(|stage| stage.translated().stores);
-        // Another host list (a new one after a cut, or this one after its
-        // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.new_indirect_window() {
-            self.window = None;
-        }
         if !windowed {
             // A dispatch, or shaders that store to buffers (or a count
             // buffer, or several records): arguments may be written from
             // here on (`crate::indirect::gather`).
             list.gather_close();
+        }
+        let windowed = windowed && crate::indirect::stable_source(&args);
+        // Another host list (a new one after a cut, or this one after its
+        // reset) has another scratch buffer, or this one's with old bytes.
+        if !windowed || list.new_indirect_window() {
+            self.window = None;
         }
         let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
         let hit = self
@@ -4119,7 +4278,14 @@ impl State {
             None
         };
         let (bounded, at) = match (hit, gathered) {
-            (None, Some((scratch, at))) => {
+            (None, Some((scratch, at, recorded))) => {
+                // A segment's pass recorded here bound our pipeline
+                // (`crate::indirect::gather_segments`; fxceless/victory-fork
+                // e4245f3c).
+                if recorded {
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
                 // The record's bytes are up to date when the list is
                 // submitted, as for a record clamped in the list.
                 args.refresh(list, arguments, len);
@@ -4365,7 +4531,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // a texture the host writes: that texture's texels, copied on
             // the host (title memory does not have them).
             let aliased = crate::resource::alias_of(*resource as This)
-                .is_some_and(|source| crate::texture::alias(list, *resource as This, source));
+                .is_some_and(|source| crate::texture::alias(list, *resource as This, source.get()));
             if !aliased
                 && let Some(t) = crate::resource::host_resource(*resource as This)
                 && crate::texture::title_written(t)
@@ -4684,7 +4850,7 @@ mod early_textures_tests {
     /// Two draws bind the same table of one constant buffer view with a
     /// buffer copy of the list between them: the second must not reuse the
     /// first's upload of the constants, which is filled before the copy
-    /// runs (review of 2026-11-25, item 4).
+    /// runs.
     #[test]
     fn a_constant_table_is_not_reused_across_a_title_copy() {
         let Some(host) = crate::host::host() else { return };
@@ -4903,7 +5069,7 @@ mod heap_ranges_tests {
         let weak = Arc::downgrade(&copy);
 
         let mut picked = HeapPicked::new(false);
-        picked.keep(0, Arc::as_ptr(&copy) as usize, &copy, start, start + 4096, [0; 3], None);
+        picked.keep(0, Arc::as_ptr(&copy) as usize, &copy, start, start + 4096, [0; 3], None, 0);
         HEAP_RANGES
             .lock()
             .unwrap_or_else(|e| e.into_inner())

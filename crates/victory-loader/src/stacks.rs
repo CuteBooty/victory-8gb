@@ -34,6 +34,7 @@ pub fn dump_stacks_on_schedule() {
     times.sort_by(f64::total_cmp);
     let start = std::time::Instant::now();
     std::thread::spawn(move || {
+        crate::threads::place_thread("stack sampler");
         for t in times {
             let at = std::time::Duration::from_secs_f64(t.max(0.0));
             std::thread::sleep(at.saturating_sub(start.elapsed()));

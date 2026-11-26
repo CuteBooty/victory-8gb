@@ -15,6 +15,19 @@ use crate::{DLL_PROCESS_DETACH, LoadedImage};
 const DLL_THREAD_ATTACH: u32 = 2;
 const DLL_THREAD_DETACH: u32 = 3;
 
+static PLACEMENT: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Installed by the runtime before it starts any loader threads.
+pub fn set_thread_placement(place: fn(&str)) {
+    let _ = PLACEMENT.set(place);
+}
+
+pub(crate) fn place_thread(name: &str) {
+    if let Some(place) = PLACEMENT.get() {
+        place(name);
+    }
+}
+
 struct Mapped {
     image: Arc<LoadedImage>,
     /// Its `DLL_PROCESS_ATTACH` is done; only then does it get thread notices.
@@ -108,6 +121,7 @@ extern "C" fn detach_all() {
     // Its thread id, set when it runs its own code; 0 until then.
     static WATCHDOG: AtomicU32 = AtomicU32::new(0);
     drop(std::thread::spawn(|| {
+        place_thread("detach watchdog");
         // SAFETY: a plain query of the calling thread.
         let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
         WATCHDOG.store(id, Ordering::SeqCst);

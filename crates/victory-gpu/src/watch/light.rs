@@ -1,12 +1,13 @@
 //! Published guard answers, modelled on a tree from the avatarmanz lineage.
 //! Keep the clean bit and the journal write it vouches for in ONE atomic
 //! word. Two shadows can have copied the same block at different askings.
+use super::port::{Claims, Held};
 use super::{BLOCK, BlockRuns, Guards, guards};
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{
     AtomicU64,
-    Ordering::{Acquire, Relaxed, Release},
+    Ordering::{AcqRel, Acquire, Relaxed, Release},
 };
 
 pub fn on() -> bool {
@@ -22,11 +23,11 @@ pub(super) fn opaque_io() -> bool { OPAQUE_IO.load(Acquire) }
 
 pub fn quarantine_opaque_io() {
     if !on() { return; }
-    let mut g = guards();
+    let g = guards();
     if opaque_io() { return; }
     OPAQUE_IO.store(true, Release);
-    super::open_here(&mut g, 0, usize::MAX, Cause::Kernel);
-    g.clean = BlockRuns::new();
+    super::open_here(&g, 0, usize::MAX, Cause::Kernel);
+    g.clean.clear();
     QUARANTINED.fetch_add(1, Relaxed);
 }
 
@@ -63,7 +64,8 @@ impl<const N: usize> Bits<N> {
         Some(&self.0.get(page / PIECE)?.get()?[page % PIECE])
     }
 
-    // Only the guards lock writes the words; readers never acquire it.
+    // Written under GUARDS (alone, or shared with the block's claims,
+    // `super::port`); readers never acquire it.
     fn set(&self, page: usize, stamp: u64) -> bool {
         self.set_state(page, stamp, 1)
     }
@@ -79,18 +81,29 @@ impl<const N: usize> Bits<N> {
         }
         let words = chunk.get_or_init(|| (0..PIECE).map(|_| AtomicU64::new(0)).collect());
         let word = &words[page % PIECE];
-        // Writers hold GUARDS. Retain the high-water mark even while clear.
-        let old = word.load(Relaxed);
-        if stamp < old >> 6 { return false; }
-        word.store((stamp << 6) | (old & 60) | state, Release);
-        true
+        // Retain the high-water mark even while clear. A compare and swap:
+        // with renderer port 6 (`super::port`) a publisher holds GUARDS
+        // shared and the claims of the block and its views, and a refresh
+        // beside it may clear the word of a view it found not all claimed;
+        // a load and a store could lose that clear or this stamp.
+        let mut old = word.load(Acquire);
+        loop {
+            if stamp < old >> 6 { return false; }
+            match word.compare_exchange_weak(old, (stamp << 6) | (old & 60) | state, AcqRel, Acquire) {
+                Ok(_) => return true,
+                Err(now) => old = now,
+            }
+        }
     }
 
     fn clear(&self, page: usize, cause: Cause) -> bool {
         self.entry(page).is_some_and(|word| {
-            let old = word.load(Relaxed);
-            let reason = if cause == Cause::Check { old & 60 } else { (cause as u64) << 2 };
-            word.store((old & !63) | reason, Release);
+            // (A compare and swap, as `set_state`.)
+            let clear = |old: u64| {
+                let reason = if cause == Cause::Check { old & 60 } else { (cause as u64) << 2 };
+                Some((old & !63) | reason)
+            };
+            let old = word.fetch_update(AcqRel, Acquire, clear).unwrap_or_else(|old| old);
             old & 1 != 0
         })
     }
@@ -149,11 +162,13 @@ pub(super) fn clear(page: usize, cause: Cause) {
 
 /// Called after journal insertion while the journal writer still orders
 /// overlapping polls. Recheck under GUARDS: a fault may have beaten us.
+/// (With renderer port 6, `super::port`, GUARDS shared and each block's
+/// claims, and those of its page's other views, waited for.)
 pub(super) fn publish_poll(first: usize, last: usize, pages: &[usize], stamp: u64, written: &BTreeMap<usize, u64>) {
     if !on() || super::view_ask() { return; }
     if pages.is_empty() { return retry_clean(first, last, written); }
-    let mut g = guards();
-    for &p in pages { publish_block(&mut g, p, stamp); }
+    let mut g = Held::take();
+    for &p in pages { publish_one(&mut g, p, stamp); }
     // Mixed ranges can repeatedly miss on a clean block beside a hot one.
     // Guard results are in address order. Each newly observed page was
     // already considered above, including pages withheld on this poll.
@@ -166,8 +181,8 @@ fn unpublished(p: usize) -> bool {
     BITS.entry(p).is_none_or(|word| word.load(Acquire) & 1 == 0)
 }
 
-fn retry_block(g: &mut Guards, p: usize, stamp: u64) {
-    if g.clean.contains_range(p, p + 1) && publish_block(g, p, stamp) {
+fn retry_block(g: &mut Held, p: usize, stamp: u64) {
+    if g.clean.contains_range(p, p + 1) && publish_one(g, p, stamp) {
         RETRIED.fetch_add(1, Relaxed);
     }
 }
@@ -178,13 +193,40 @@ pub(super) fn retry_clean(first: usize, last: usize, written: &BTreeMap<usize, u
     if !on() || super::view_ask() { return; }
     let mut missing = written.range(first..last).filter(|&(&p, _)| unpublished(p)).peekable();
     if missing.peek().is_none() { return; }
-    let mut g = guards();
+    let mut g = Held::take();
     for (&p, &stamp) in missing {
         retry_block(&mut g, p, stamp);
     }
 }
 
-fn publish_block(g: &mut Guards, p: usize, stamp: u64) -> bool {
+/// [`publish_block`] with the guards as held: alone, or shared with the
+/// claims of `p` and its page's other views.
+fn publish_one(g: &mut Held, p: usize, stamp: u64) -> bool {
+    match g {
+        Held::Alone(g) => {
+            let (done, _probe) = publish_block(g, p, stamp, None);
+            #[cfg(feature = "diagnostics")]
+            if let Some(old) = _probe {
+                // Forced slow copies advance the journal even without a guard
+                // clear. Preserve this diagnostic baseline across those copies.
+                let probe = &mut g.windows.fingerprints[p % PROBE_SLOTS];
+                if (probe.0, probe.1) == (p, old >> 6) { probe.1 = stamp; }
+            }
+            done
+        }
+        Held::Shared(g) => {
+            let claims = Claims::wait_for(&super::port::publish_views(p), false);
+            super::port::published();
+            // (The diagnostic baseline of a quarantined block is not moved
+            // on here: the write windows change only under GUARDS alone.)
+            publish_block(g, p, stamp, Some(&claims)).0
+        }
+    }
+}
+
+/// Whether `p` was published; and, for a quarantined block whose diagnostic
+/// baseline the caller moves on (diagnostics), its word before.
+fn publish_block(g: &Guards, p: usize, stamp: u64, claims: Option<&Claims>) -> (bool, Option<u64>) {
     let mut busy = false;
     let mut quarantined = false;
     let safe = super::view_guard()
@@ -196,9 +238,14 @@ fn publish_block(g: &mut Guards, p: usize, stamp: u64) -> bool {
             !busy
                 && shown.iter().all(|at| {
                     let b = at / BLOCK;
-                    g.protected.contains(&b) && (shown.len() == 1 || g.aliased.contains(&b))
+                    g.protected.contains(b) && (shown.len() == 1 || g.aliased.contains(b))
+                        // (Shared: a view whose claim is not held may be
+                        // changing now.)
+                        && claims.is_none_or(|c| c.holds(b))
                 })
         }).unwrap_or(false);
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
+    let mut probe = None;
     if !safe {
         if busy {
             // A bypass writer can change the page repeatedly without a
@@ -216,20 +263,17 @@ fn publish_block(g: &mut Guards, p: usize, stamp: u64) -> bool {
         if let Some(old) = BITS.entry(p).map(|w| w.load(Acquire))
             && old & 2 != 0 && !g.windows.fingerprints.is_empty()
         {
-            // Forced slow copies advance the journal even without a guard
-            // clear. Preserve this diagnostic baseline across those copies.
-            let probe = &mut g.windows.fingerprints[p % PROBE_SLOTS];
-            if (probe.0, probe.1) == (p, old >> 6) { probe.1 = stamp; }
+            probe = Some(old);
         }
         BITS.set_state(p, stamp, 2);
         g.clean.remove(p);
         WITHHELD.fetch_add(1, Relaxed);
     } else if BITS.set(p, stamp) {
-        return true;
+        return (true, probe);
     } else {
         WITHHELD.fetch_add(1, Relaxed);
     }
-    false
+    (false, probe)
 }
 
 type Physical = (usize, u64, usize); // section handle, byte offset, length
@@ -276,9 +320,10 @@ impl Windows {
 
     fn failed_block(&self, _p: usize) -> bool {
         #[cfg(feature = "diagnostics")]
-        { return self.failures.contains_key(&_p); }
+        let failed = self.failures.contains_key(&_p);
         #[cfg(not(feature = "diagnostics"))]
-        { false }
+        let failed = false;
+        failed
     }
 
     fn exclude(&mut self, (section, offset, len): Physical) {
@@ -349,7 +394,7 @@ pub(super) fn invalidate(g: &mut Guards, spans: &[Physical], cause: Cause) {
     for &(section, offset, len) in spans {
         for (at, bytes) in crate::inplace::views_of_section(section, offset, len) {
             let (first, last) = (at / BLOCK, at.saturating_add(bytes).div_ceil(BLOCK));
-            for &b in g.protected.range(first..last) {
+            for b in g.protected.range(first..last) {
                 clear(b, cause);
             }
             g.clean.remove_range(first, last);
@@ -537,7 +582,7 @@ pub(super) fn view_miss(g: &Guards, first: usize, last: usize) {
     if !detailed { return note(true, Miss::UnclassifiedView); }
     let p = (first..last).find(|&p| unpublished(p));
     let why = p.map_or(Miss::Other, |p| {
-        if g.absent.contains(&p) { return Miss::Hole; }
+        if g.absent.contains(p) { return Miss::Hole; }
         if g.heat.get(&p).is_some_and(|h| h.held_since_arm && crate::queue::presented() < h.until) {
             return Miss::Hot;
         }
@@ -657,7 +702,7 @@ pub(super) fn check_answer(first: usize, last: usize, written: &BTreeMap<usize, 
             && written.get(&p) == Some(&(word >> 6))
             && crate::inplace::publishable_view(p * BLOCK, |s, off, shown| {
                 !g.windows.busy(s, off) && shown.iter().all(|&at| {
-                    g.protected.contains(&(at / BLOCK)) && (shown.len() == 1 || g.aliased.contains(&(at / BLOCK)))
+                    g.protected.contains(at / BLOCK) && (shown.len() == 1 || g.aliased.contains(at / BLOCK))
                         && readonly_block(at)
                 })
             }) == Ok(true);
@@ -822,6 +867,50 @@ mod tests {
             assert!(!bits.all(0, 1, |_, w| w <= 4));
             assert!(bits.all(0, 1, |_, w| w <= 5));
         });
+    }
+
+    /// Renderer port 6 sets and clears the words from several threads at
+    /// once (`set_state` and `clear` by compare and swap): the highest stamp
+    /// set stays, a stamp below it never lands, and every thread's last
+    /// clear or set is one of the words seen.
+    #[test]
+    fn set_state_and_clear_keep_the_highest_stamp_under_contention() {
+        let bits = Bits::<1>::new();
+        const THREADS: u64 = 8;
+        const EACH: u64 = 20_000;
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let bits = &bits;
+                s.spawn(move || {
+                    for k in 1..=EACH {
+                        let stamp = k * THREADS + t;
+                        bits.set(0, stamp);
+                        if k % 7 == 0 {
+                            bits.clear(0, Cause::Fault);
+                        }
+                        let word = bits.entry(0).unwrap().load(Acquire);
+                        assert!(word >> 6 >= stamp, "a stamp went back: {} < {stamp}", word >> 6);
+                    }
+                });
+            }
+        });
+        let high = EACH * THREADS + THREADS - 1;
+        assert_eq!(bits.entry(0).unwrap().load(Acquire) >> 6, high, "the highest stamp stays");
+        // Older stamps never land, nor publish, once a newer one stood.
+        bits.clear(0, Cause::Fault);
+        std::thread::scope(|s| {
+            for t in 0..THREADS {
+                let bits = &bits;
+                s.spawn(move || {
+                    for k in 1..=EACH {
+                        assert!(!bits.set(0, k * THREADS + t - 1));
+                    }
+                });
+            }
+        });
+        assert!(!bits.all(0, 1, |_, _| true), "the clear stands");
+        assert!(bits.set(0, high));
+        assert!(bits.all(0, 1, |_, w| w == high));
     }
 
     #[test]

@@ -119,6 +119,208 @@ mod light_range_tests {
     }
 }
 
+/// `VICTORY_STANDING_SKIP=1` (off by default): a refresh whose range the
+/// submission's standing write-watch asking answers, with no write after
+/// the bytes the copy holds, is not made ([`Shadow::standing_nothing_new`]).
+/// With or without `VICTORY_LIGHT_REFRESH`. Modelled on
+/// avatarmanz/VIctory-7900XTX 2aa8134b.
+pub(crate) fn standing_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STANDING_SKIP").is_some_and(|v| v == "1"))
+}
+
+/// What [`standing_vouches`] found; past `Skip` each is its counter's index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Standing {
+    Skip = 0,
+    Off = 1,
+    /// A shader write declared over the range is in flight.
+    Pending = 2,
+    /// The card wrote a page of it since its last whole copy.
+    Gpu = 3,
+    /// A page was written after its copy, or never copied whole.
+    Stamps = 4,
+}
+
+// Counters for the frame line: indexes past `Standing`'s.
+const S_SKIPPED: usize = 0;
+const S_LOOKED: usize = 5;
+const S_NO_ANSWER: usize = 6;
+const S_SAMPLES: usize = 7;
+const S_MISMATCHES: usize = 8;
+const S_INCONCLUSIVE: usize = 9;
+/// Differences found on pages written after the standing asking.
+const S_LATE: usize = 10;
+static STANDING: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+/// Whether the kernel's write watch has the 4 KiB page holding `at` written
+/// since its last reset (a query that resets nothing); `None` if the memory
+/// is not write-watched (a view, or memory reserved without the watch).
+#[cfg(feature = "diagnostics")]
+fn kernel_page_written(at: usize) -> Option<bool> {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let page = at & !4095;
+    let mut found = [std::ptr::null_mut(); 1];
+    let (mut count, mut granularity) = (found.len(), 0);
+    // SAFETY: a query that writes only our own arrays.
+    let failed = unsafe { GetWriteWatch(0, page as _, 4096, found.as_mut_ptr(), &mut count, &mut granularity) } != 0;
+    (!failed).then_some(count != 0)
+}
+
+/// Whether the standing asking's answer `written` (each page of `[from,
+/// to)` written since tracking began, with the asking that last found it;
+/// [`crate::watch::asked`]) proves the copy holds every write: no shader
+/// write is pending over the range, the card wrote none of its pages, each
+/// page was copied whole (a stamp) or the range lies inside one taken whole
+/// (`ranged`), and no page was found written by an asking later than the
+/// one after which its bytes were taken. In doubt: not `Skip`.
+fn standing_vouches(
+    on: bool, from: usize, to: usize, base: usize, copied: &Copied, pending: &[(usize, usize)], written: &[(usize, u64)],
+) -> Standing {
+    if !on {
+        return Standing::Off;
+    }
+    if from >= to || pending.iter().any(|&(a, e)| a < to && from < e) {
+        return Standing::Pending;
+    }
+    let (first, last) = (from / PAGE, to.div_ceil(PAGE));
+    let Some(at) = first.checked_sub(base) else { return Standing::Stamps };
+    let Some(stamps) = copied.pages.get(at..last - base) else { return Standing::Stamps };
+    if !copied.gpu.is_empty() && copied.gpu.get(at..last - base).is_none_or(|g| g.contains(&true)) {
+        return Standing::Gpu;
+    }
+    let ranged = copied.ranged(from, to);
+    if ranged == 0 && stamps.contains(&0) {
+        return Standing::Stamps;
+    }
+    let held = written.iter().all(|&(page, write)| {
+        page.checked_sub(first).and_then(|i| stamps.get(i)).is_some_and(|&stamp| write <= stamp.max(ranged))
+    });
+    if held { Standing::Skip } else { Standing::Stamps }
+}
+
+/// With the frame-rate line: what the standing skip did per frame.
+pub(crate) fn standing_line(frames: f64) {
+    if !standing_skip() {
+        return;
+    }
+    let per = |i: usize| STANDING[i].swap(0, Ordering::Relaxed) as f64 / frames;
+    let total = |i: usize| STANDING[i].swap(0, Ordering::Relaxed);
+    tracing::info!(
+        "standing write-watch skips per frame (VICTORY_STANDING_SKIP=1): {:.1} refreshes skipped of {:.1} looked at; \
+         not skipped: {:.1} without a standing asking, {:.1} beside pending shader writes, {:.1} the card wrote, \
+         {:.1} written after their copy or never copied whole; standing check samples {}, standing mismatches {}, \
+         standing inconclusive {}, standing late writes {} (written after the standing asking: the refresh would \
+         have missed them too; interval totals)",
+        per(S_SKIPPED),
+        per(S_LOOKED),
+        per(S_NO_ANSWER),
+        per(Standing::Pending as usize),
+        per(Standing::Gpu as usize),
+        per(Standing::Stamps as usize),
+        total(S_SAMPLES),
+        total(S_MISMATCHES),
+        total(S_INCONCLUSIVE),
+        total(S_LATE),
+    );
+}
+
+#[cfg(test)]
+mod standing_tests {
+    use super::{Copied, PAGE, Standing, standing_vouches};
+
+    /// Runs `test` on its own thread: a hang fails after ten seconds.
+    fn timed(test: fn()) {
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            test();
+            let _ = done.send(());
+        });
+        match wait.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("hung"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the test failed"),
+        }
+    }
+
+    // A copy of pages 100..104 (from 100 * PAGE), each copied whole after
+    // asking 5 (as `copy_stale` notes them).
+    const BASE: usize = 100;
+    fn copy() -> Copied {
+        Copied { pages: vec![5; 4], ..Default::default() }
+    }
+    fn range(first: usize, last: usize) -> (usize, usize) {
+        (first * PAGE, last * PAGE)
+    }
+
+    #[test]
+    fn a_page_written_after_its_copy_is_not_skipped() {
+        timed(|| {
+            let (from, to) = range(100, 103);
+            // Found written by asking 7, after the copy at 5.
+            let written = [(100, 3), (101, 7)];
+            assert_eq!(standing_vouches(true, from, to, BASE, &copy(), &[], &written), Standing::Stamps);
+            // Found by asking 5 itself: before the bytes were taken.
+            assert_eq!(standing_vouches(true, from, to, BASE, &copy(), &[], &[(101, 5)]), Standing::Skip);
+            // A whole-range copy at 6 vouches only up to 6.
+            let mut copied = copy();
+            copied.remember(from, to, 6);
+            assert_eq!(standing_vouches(true, from, to, BASE, &copied, &[], &[(101, 6)]), Standing::Skip);
+            assert_eq!(standing_vouches(true, from, to, BASE, &copied, &[], &written), Standing::Stamps);
+        });
+    }
+
+    #[test]
+    fn a_partial_end_page_is_not_skipped() {
+        timed(|| {
+            // An earlier refresh took [100 * PAGE, 102 * PAGE + 100): page
+            // 102 only in part, so it has no stamp; its range was noted.
+            let mut copied = Copied { pages: vec![5, 5, 0, 0], ..Default::default() };
+            copied.remember(100 * PAGE, 102 * PAGE + 100, 5);
+            // The same bytes: the range vouches.
+            assert_eq!(standing_vouches(true, 100 * PAGE, 102 * PAGE + 100, BASE, &copied, &[], &[]), Standing::Skip);
+            // More of the partial page than was taken: not skipped.
+            assert_eq!(standing_vouches(true, 100 * PAGE, 102 * PAGE + 200, BASE, &copied, &[], &[]), Standing::Stamps);
+            assert_eq!(standing_vouches(true, 102 * PAGE + 50, 103 * PAGE, BASE, &copied, &[], &[]), Standing::Stamps);
+            // Without the noted range, the stampless page never vouches.
+            let bare = Copied { pages: vec![5, 5, 0, 0], ..Default::default() };
+            assert_eq!(standing_vouches(true, 101 * PAGE, 102 * PAGE + 1, BASE, &bare, &[], &[]), Standing::Stamps);
+            // A range outside the copy's pages is not vouched for.
+            assert_eq!(standing_vouches(true, 103 * PAGE, 105 * PAGE, BASE, &copy(), &[], &[]), Standing::Stamps);
+            assert_eq!(standing_vouches(true, 99 * PAGE, 101 * PAGE, BASE, &copy(), &[], &[]), Standing::Stamps);
+        });
+    }
+
+    #[test]
+    fn a_range_with_a_pending_write_is_not_skipped() {
+        timed(|| {
+            let (from, to) = range(100, 102);
+            let pending = [(101 * PAGE + 8, 101 * PAGE + 16)];
+            assert_eq!(standing_vouches(true, from, to, BASE, &copy(), &pending, &[]), Standing::Pending);
+            // One that only touches the range's end does not overlap.
+            assert_eq!(standing_vouches(true, from, to, BASE, &copy(), &[(to, to + 8)], &[]), Standing::Skip);
+            // The card wrote a page since its last whole copy.
+            let mut copied = copy();
+            copied.gpu = vec![false, true, false, false];
+            assert_eq!(standing_vouches(true, from, to, BASE, &copied, &[], &[]), Standing::Gpu);
+            assert_eq!(standing_vouches(true, 102 * PAGE, 104 * PAGE, BASE, &copied, &[], &[]), Standing::Skip);
+        });
+    }
+
+    #[test]
+    fn an_unwritten_range_is_skipped_only_with_the_switch_on() {
+        timed(|| {
+            let (from, to) = range(100, 104);
+            assert_eq!(standing_vouches(true, from, to, BASE, &copy(), &[], &[]), Standing::Skip);
+            assert_eq!(standing_vouches(false, from, to, BASE, &copy(), &[], &[]), Standing::Off);
+            // Writes before the copy only.
+            let written = [(100, 1), (103, 5)];
+            assert_eq!(standing_vouches(true, from, to, BASE, &copy(), &[], &written), Standing::Skip);
+            assert_eq!(standing_vouches(false, from, to, BASE, &copy(), &[], &written), Standing::Off);
+        });
+    }
+}
+
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
 /// shaders see.
 struct Card {
@@ -1130,6 +1332,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
             let at = (i * each).min(len);
             let n = each.min(len - at);
             s.spawn(move || {
+                crate::cores::worker("wide copy");
                 // SAFETY: a part of the caller's ranges.
                 unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
             });
@@ -1184,6 +1387,7 @@ fn workers() -> &'static Workers {
         let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                crate::cores::worker("wide worker");
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -1607,6 +1811,18 @@ mod wide_tests {
     }
 }
 
+/// Why [`Shadow::merge_under_writes`] (or, without `VICTORY_LATE_WAIT=2`,
+/// the plain [`Shadow::stale_under_writes`]) still settles the flights,
+/// for the frame-rate line: more changed runs than `VICTORY_MERGE_CAP`,
+/// memory not watched, no answer from the journal (nor the kernel, nor
+/// the guards), no snapshot to compare with, anything else.
+pub(crate) const STALE_RUN_CAP: usize = 0;
+pub(crate) const STALE_UNTRACKED: usize = 1;
+pub(crate) const STALE_NO_JOURNAL: usize = 2;
+pub(crate) const STALE_NO_SNAPSHOT: usize = 3;
+pub(crate) const STALE_OTHER: usize = 4;
+pub(crate) const STALE_CAUSES: [&str; 5] = ["run cap exceeded", "untracked memory", "no journal", "no snapshot", "other"];
+
 /// Since the last frame-rate line, of [`Shadow::merge_under_writes`]: pages
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -1641,6 +1857,166 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         runs.push((first, i - first));
     }
     runs
+}
+
+/// How [`Shadow::merge_under_writes`] finds the runs that changed
+/// (`VICTORY_RUNS_AVX2`; unset by default: [`changed_runs`], untimed):
+/// `0` [`changed_runs`], timed; `1` the same runs, byte for byte, found 32
+/// bytes at a time with AVX2 where the processor has it. Other settings
+/// warn once and use mode 1. Unchanged bytes may have been written by a flight.
+///
+/// The AVX2 compare is ported from trustno1-coder/VIctory-NVIDIA b6202840
+/// (`word_runs`, avatarmanz lineage), GPL-3.0, without its threads.
+pub(crate) fn runs_avx2() -> Option<u8> {
+    static MODE: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let value = std::env::var_os("VICTORY_RUNS_AVX2")?;
+        Some(match value.to_str().and_then(|s| s.trim().parse::<u8>().ok()) {
+            Some(mode @ 0..=1) => mode,
+            _ => {
+                tracing::warn!("unsupported VICTORY_RUNS_AVX2 setting; using byte-exact mode 1");
+                1
+            }
+        })
+    })
+}
+
+/// Since the last frame-rate line, with [`runs_avx2`] set: nanoseconds spent
+/// finding runs, pages compared, runs found.
+static RUNS_TIMED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The changed bytes of [`Shadow::merge_under_writes`] (see [`runs_avx2`]).
+fn runs_under_writes(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+    let Some(mode) = runs_avx2() else {
+        return changed_runs(title, held);
+    };
+    let began = std::time::Instant::now();
+    let runs = if mode == 1 { byte_runs(title, held) } else { changed_runs(title, held) };
+    RUNS_TIMED[0].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    RUNS_TIMED[1].fetch_add(1, Ordering::Relaxed);
+    RUNS_TIMED[2].fetch_add(runs.len() as u64, Ordering::Relaxed);
+    runs
+}
+
+/// With the frame-rate line: what [`runs_under_writes`] did per frame.
+pub(crate) fn runs_line(frames: f64) {
+    let Some(mode) = runs_avx2() else {
+        return;
+    };
+    let [nanos, pages, runs] = [0, 1, 2].map(|i| RUNS_TIMED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "changed runs under flights' writes per frame (VICTORY_RUNS_AVX2={mode}, AVX2 {}): {:.2} ms finding them in {pages:.0} pages, {runs:.0} runs",
+        if has_avx2() { "there" } else { "not there" },
+        nanos / 1e6
+    );
+}
+
+fn has_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
+/// Adds the runs of `differ`'s set bits (`width` of them, the rest clear),
+/// one bit per byte from `base` on, to `runs`; `open` is where a run
+/// still going began.
+fn walk_bits(differ: u64, width: u32, base: usize, open: &mut Option<usize>, runs: &mut Vec<(usize, usize)>) {
+    let mut p = 0;
+    while p < width {
+        let rest = differ >> p;
+        match *open {
+            Some(first) => {
+                p += rest.trailing_ones().min(width - p);
+                if p < width {
+                    runs.push((first, base + p as usize - first));
+                    *open = None;
+                }
+            }
+            None => {
+                if rest == 0 {
+                    break;
+                }
+                p += rest.trailing_zeros();
+                *open = Some(base + p as usize);
+            }
+        }
+    }
+}
+
+/// [`changed_runs`], with AVX2 where the processor has it.
+fn byte_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: the processor has AVX2.
+        return unsafe { byte_runs_avx2(now, was) };
+    }
+    changed_runs(now, was)
+}
+
+/// # Safety
+/// The processor has AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn byte_runs_avx2(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let n = now.len().min(was.len());
+    let (mut runs, mut open) = (Vec::new(), None);
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: inside both slices (`i + 32 <= n`).
+        let same = unsafe { _mm256_cmpeq_epi8(_mm256_loadu_si256(now.as_ptr().add(i).cast()), _mm256_loadu_si256(was.as_ptr().add(i).cast())) };
+        let differ = !(_mm256_movemask_epi8(same) as u32);
+        if differ != 0 || open.is_some() {
+            walk_bits(u64::from(differ), 32, i, &mut open, &mut runs);
+        }
+        i += 32;
+    }
+    for j in i..n {
+        walk_bits(u64::from(now[j] != was[j]), 1, j, &mut open, &mut runs);
+    }
+    if let Some(first) = open {
+        runs.push((first, n - first));
+    }
+    runs
+}
+
+#[cfg(test)]
+mod runs_tests {
+    use super::{byte_runs, changed_runs};
+
+    /// Random buffers with scattered changes: the AVX2 runs are the scalar
+    /// ones, byte for byte.
+    #[test]
+    fn avx2_runs_are_the_scalar_runs() {
+        let mut seed = 0x2545_f491u32;
+        let mut random = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        for round in 0..2000 {
+            let n = random() as usize % 700;
+            let was: Vec<u8> = (0..n + 3).map(|_| random() as u8).collect();
+            let mut now = was.clone();
+            let changes = if n == 0 { 0 } else { random() % 40 };
+            for _ in 0..changes {
+                let at = random() as usize % n;
+                let len = (random() as usize % if random() % 4 == 0 { 100 } else { 3 }).min(n - at);
+                for b in &mut now[at..at + len] {
+                    *b = b.wrapping_add(1 + random() as u8 % 255);
+                }
+            }
+            // Unaligned starts too.
+            let skew = random() as usize % 4;
+            let (now, was) = (&now[skew..skew + n], &was[skew..skew + n]);
+            let exact = changed_runs(now, was);
+            assert_eq!(byte_runs(now, was), exact, "round {round}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1972,6 +2348,10 @@ impl Shadow {
         self.id
     }
 
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -2059,6 +2439,12 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
+    /// Whether [`Shadow::writing`] of the range would return at once: a copy
+    /// in place, or the range pending already (`VICTORY_DECLARE_ONCE_CHECK`).
+    pub(crate) fn declared(&self, address: usize, len: usize) -> bool {
+        self.place.is_some() || self.pending.lock().unwrap_or_else(|e| e.into_inner()).contains(&(address, address + len))
+    }
+
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
     /// one snapshot per copy and submission, each byte taken once, when the
@@ -2082,7 +2468,7 @@ impl Shadow {
         if pending.contains(&range) {
             return;
         }
-        if crate::watch::light::on() {
+        if crate::watch::light::on() || standing_skip() {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             let pages = copied.pages.len();
             copied.gpu.resize(pages, false);
@@ -2426,7 +2812,10 @@ impl Shadow {
             let parts: Vec<_> = (0..threads)
                 .map(|i| {
                     let (a, b) = (cut(i), cut(i + 1));
-                    s.spawn(move || scan(a, b))
+                    s.spawn(move || {
+                        crate::cores::worker("shadow scan");
+                        scan(a, b)
+                    })
                 })
                 .collect();
             parts
@@ -2572,14 +2961,15 @@ impl Shadow {
     /// snapshot, so the compare after the card ran takes them for the
     /// title's and not the shaders').
     ///
-    /// Whether the caller must still settle the flights: the journal
-    /// cannot say what was written, a snapshot is missing, or `runs_left`
-    /// ran out. Pages done before that stay done.
-    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+    /// Whether the caller must still settle the flights, and why (one of
+    /// the `STALE_` causes): memory not watched, the journal cannot say
+    /// what was written, a snapshot is missing, or `runs_left` ran out.
+    /// Pages done before that stay done.
+    pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> Option<usize> {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
-            return false;
+            return None;
         }
         let busy: Vec<(usize, usize)> = self
             .pending
@@ -2590,10 +2980,10 @@ impl Shadow {
             .map(|&(a, e)| (a.max(from), e.min(to)))
             .collect();
         if busy.is_empty() {
-            return false;
+            return None;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
-            return true;
+            return Some(STALE_UNTRACKED);
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
@@ -2605,7 +2995,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                return true;
+                return Some(STALE_NO_JOURNAL);
             };
             let stale: Vec<usize> = {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -2642,9 +3032,9 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = changed_runs(title, held);
+                    let runs = runs_under_writes(title, held);
                     if runs.len() > *runs_left {
-                        return true;
+                        return Some(STALE_RUN_CAP);
                     }
                     *runs_left -= runs.len();
                     for (r, m) in runs {
@@ -2655,13 +3045,13 @@ impl Shadow {
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
-                        return true;
+                        return Some(STALE_NO_SNAPSHOT);
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
                     // bytes at the copy's offsets (`writing`), and these
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
+                    for (r, m) in runs_under_writes(title, held) {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.
@@ -2683,21 +3073,37 @@ impl Shadow {
                 }
             }
         }
-        false
+        None
     }
 
     /// Can the refresh use its existing host bytes? Only a published journal
     /// write for *every* block can vouch for a whole or partial-page copy.
+    ///
+    /// With `VICTORY_STANDING_SKIP=1` (with or without the light refresh)
+    /// the submission's standing write-watch asking can vouch too
+    /// ([`Shadow::standing_nothing_new`]).
     pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
         use crate::watch::light;
-        if !light::on() { return false; }
-        if self.place.is_some() { return true; }
+        let (light_on, standing) = (light::on(), standing_skip());
+        if !light_on && !standing { return false; }
+        // In place: as before with the light refresh; the standing skip
+        // leaves such copies to the refresh, which does nothing with them.
+        if self.place.is_some() { return light_on; }
         #[cfg(feature = "diagnostics")]
         if crate::copystat::mode() == 2 { return false; } // timing run: the copy has no source bytes
         let start = self.start as usize;
         let (from, to) = (address.max(start), address.saturating_add(len).min(start + self.len as usize));
         if from >= to { return true; }
         if self.watched.load(Ordering::Relaxed) != 1 { return false; }
+        if light_on && self.light_nothing_new(from, to) { return true; }
+        standing && self.standing_nothing_new(from, to)
+    }
+
+    /// The light refresh's part of [`Shadow::nothing_new`], for `[from,
+    /// to)` inside the buffer, write-watched.
+    fn light_nothing_new(&self, from: usize, to: usize) -> bool {
+        use crate::watch::light;
+        let start = self.start as usize;
         let candidate = light::candidate(from, to);
         #[cfg(feature = "diagnostics")]
         let candidate = candidate || light::trial_candidate(from, to);
@@ -2735,6 +3141,104 @@ impl Shadow {
         self.refresh_check(from, to);
         light::SKIPPED.fetch_add(1, Ordering::Relaxed);
         true
+    }
+
+    /// `VICTORY_STANDING_SKIP=1` (modelled on avatarmanz/VIctory-7900XTX
+    /// 2aa8134b, `Shadow::nothing_new` and `watch::nothing_new`, by its
+    /// authors): `[from, to)` (inside the buffer, write-watched) is not
+    /// refreshed when the submission's standing write-watch asking
+    /// ([`crate::watch::asked`], made by `ask_once` / `ask_ahead`) answers
+    /// for it and shows no write after the bytes the copy holds
+    /// ([`standing_vouches`]). The refresh would have taken the same answer
+    /// (`writes` answers from that asking first) and copied nothing.
+    fn standing_nothing_new(&self, from: usize, to: usize) -> bool {
+        STANDING[S_LOOKED].fetch_add(1, Ordering::Relaxed);
+        // Asked before the copy's locks, as a refresh asks before copying.
+        // `None` with opaque I/O (light refresh) and with no standing asking
+        // that holds the range: then the refresh asks, as without the switch.
+        let Some((_, written)) = crate::watch::asked(from, to) else {
+            STANDING[S_NO_ANSWER].fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        // Both held to the end: no shader writer is declared and no refresh
+        // changes the copy while this decides (and samples).
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let base = self.start as usize / PAGE;
+        match standing_vouches(standing_skip(), from, to, base, &copied, &pending, &written) {
+            Standing::Skip => {}
+            held => {
+                STANDING[held as usize].fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            if crate::watch::light::sample_due() && !self.check_standing(from, to, &written) {
+                return false;
+            }
+            use crate::copystat::{C, add};
+            add(C::Checked, (to - from) as u64);
+            add(C::Unchanged, (to - from) as u64);
+        }
+        drop((copied, pending));
+        self.refresh_check(from, to);
+        STANDING[S_SKIPPED].fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// `VICTORY_LIGHT_REFRESH_CHECK=<n>` with the standing skip: a skipped
+    /// range's copy against title memory, byte for byte. A difference is a
+    /// standing mismatch (not the light refresh's), and the range is
+    /// refreshed. The caller holds `pending` and `copied`;
+    /// `written` is the standing answer the skip was decided on.
+    ///
+    /// A difference on a page written after the standing asking (the
+    /// kernel's dirty bit set again, or the journal noting a later write
+    /// than the answer had) is not a missed write: the refresh would have
+    /// taken the same answer and copied nothing as well, and the next
+    /// asking has it. Such differences are counted apart ("standing late
+    /// writes"), not as mismatches.
+    #[cfg(feature = "diagnostics")]
+    fn check_standing(&self, from: usize, to: usize, written: &[(usize, u64)]) -> bool {
+        crate::watch::light::with_check_buffer(|buf| {
+            let mut at = from;
+            while at < to {
+                let len = buf.len().min(to - at);
+                if !crate::host::read_into(at as *const u8, &mut buf[..len]) {
+                    STANDING[S_INCONCLUSIVE].fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                // SAFETY: `[from, to)` was cut to this copy's mapping.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(at - self.start as usize), len) };
+                if let Some(i) = first_difference(host, &buf[..len]) {
+                    // A store racing the scan is not a missed write: the
+                    // byte read again must still differ the same way.
+                    let mut again = [0u8; 1];
+                    if !crate::host::read_into((at + i) as *const u8, &mut again) || again[0] != buf[i] {
+                        STANDING[S_INCONCLUSIVE].fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                    Self::standing_difference(at + i, written);
+                    return false;
+                }
+                at += len;
+            }
+            STANDING[S_SAMPLES].fetch_add(1, Ordering::Relaxed);
+            true
+        })
+    }
+
+    /// Count a stable difference by whether the page was written after the asking.
+    #[cfg(feature = "diagnostics")]
+    fn standing_difference(at: usize, written: &[(usize, u64)]) {
+        let page = at / PAGE;
+        let then = written.iter().find(|w| w.0 == page).map_or(0, |w| w.1);
+        let now = crate::watch::asked(at, at + 1);
+        let journal_now = now.as_ref().map(|(_, w)| w.iter().find(|w| w.0 == page).map_or(0, |w| w.1));
+        let dirty = kernel_page_written(at);
+        let late = dirty == Some(true) || journal_now.is_some_and(|w| w > then);
+        STANDING[if late { S_LATE } else { S_MISMATCHES }].fetch_add(1, Ordering::Relaxed);
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2997,7 +3501,7 @@ impl Shadow {
                 self.copy(a, e);
             }
         }
-        if crate::watch::light::on() {
+        if crate::watch::light::on() || standing_skip() {
             copied.remember(from, to, now);
         }
         bytes
@@ -3405,6 +3909,25 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
 
+/// Whether [`find`] of `[address, address + len)` would give `shadow`, a
+/// title buffer's copy, from the tables as they are, without making
+/// anything (`VICTORY_HEAP_SAME_SKIP`'s guard): the buffer
+/// found holds its copy already and it is this one. A window: false.
+pub(crate) fn still_found(shadow: &Arc<Shadow>, address: u64, len: u64) -> bool {
+    if shadow.window {
+        return false;
+    }
+    let Some(end) = address.checked_add(len.max(1)) else { return false };
+    let map = buffers_read();
+    // As `lookup_tables`'s fast path.
+    map.range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .find(|(_, e)| e.end >= end)
+        .and_then(|(_, e)| e.shadow.as_ref())
+        .is_some_and(|found| Arc::ptr_eq(found, shadow))
+}
+
 /// As [`find`], for an ask that is done with the copy when its list has
 /// run (a draw's vertex and index buffers, indirect arguments): outside
 /// buffer objects it takes a window that is there already and holds the
@@ -3435,6 +3958,10 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// a window made. A thread's remembered answers ([`FOUND`]) are from one
 /// count.
 static TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn table_epoch() -> u64 {
+    TABLES_CHANGED.load(Ordering::Acquire)
+}
 
 fn tables_changed() {
     TABLES_CHANGED.fetch_add(1, Ordering::Release);

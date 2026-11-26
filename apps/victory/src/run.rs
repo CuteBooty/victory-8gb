@@ -18,6 +18,9 @@ pub fn run(
 
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
+    if victory_gpu::cores::enabled() {
+        victory_loader::set_thread_placement(victory_gpu::cores::worker);
+    }
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
@@ -222,6 +225,7 @@ fn watch(base: usize, size: usize) {
         .filter(|&rva| rva + 4 <= size)
         .collect();
     std::thread::spawn(move || {
+        victory_gpu::cores::worker("value watcher");
         let mut seen = vec![None; rvas.len()];
         loop {
             for (&rva, seen) in rvas.iter().zip(&mut seen) {

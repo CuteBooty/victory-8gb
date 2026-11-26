@@ -660,6 +660,7 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    victory_gpu::cores::worker("victory XMA decoder");
                     loop {
                         xma().pump();
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.

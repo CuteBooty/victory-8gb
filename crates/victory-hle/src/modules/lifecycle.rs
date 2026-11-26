@@ -218,12 +218,14 @@ pub(crate) fn end_title(why: &'static str, then: Box<dyn FnOnce() + Send>) {
     // Not on the calling thread: titles hand the suspend to their window
     // thread and wait for it inside the routine.
     std::thread::spawn(move || {
+        victory_gpu::cores::worker("suspend");
         for (_, routine, context) in suspend {
             routine(1, context as *mut c_void);
         }
         finish("title suspended");
     });
     std::thread::spawn(move || {
+        victory_gpu::cores::worker("suspend deadline");
         std::thread::sleep(SUSPEND_DEADLINE);
         late("title did not finish suspending in time");
     });

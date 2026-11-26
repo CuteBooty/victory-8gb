@@ -204,6 +204,7 @@ pub fn run(
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
+                        victory_gpu::cores::worker("offline translator");
                         let mut t = Tally {
                             list,
                             ..Tally::default()
@@ -816,6 +817,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
+                        victory_gpu::cores::worker("offline shader cache warmer");
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let Some(bytes) = job.bytes() else { continue };
                             // As the title passes it: the container's own size

@@ -20,8 +20,7 @@ pub(crate) fn enabled() -> bool {
 /// (`VICTORY_FRAME_FEEDBACK=2`), instead of the `VICTORY_BACK_SETTLE` policy.
 /// Off by default: a flight whose only result is a small shader-written
 /// buffer has no target, and a title that keeps a mapped pointer across
-/// frames could read the old value after the present returned (review of
-/// 2026-11-25, item 3). An explicit legacy present policy
+/// frames could read the old value after the present returned. An explicit legacy present policy
 /// (including its byte threshold) wins.
 pub(crate) fn at_present() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -366,7 +365,7 @@ mod tests {
 
     /// The present keeps the `VICTORY_BACK_SETTLE` policy, which waits for
     /// small shader-written buffers too, unless asked for with `=2` and no
-    /// legacy setting (review of 2026-11-25, item 3).
+    /// legacy setting.
     #[test]
     fn the_present_keeps_the_back_settle_policy_by_default() {
         use std::ffi::OsStr;

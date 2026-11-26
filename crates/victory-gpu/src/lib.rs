@@ -22,6 +22,8 @@ mod capture;
 #[cfg(any(windows, test))]
 mod card_hash;
 pub mod console;
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub mod cores;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 pub mod descriptor;
@@ -35,6 +37,8 @@ pub mod frame;
 pub mod wait_timing;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod frame_why;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod why_more;
 mod query_why;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod heap_pass;

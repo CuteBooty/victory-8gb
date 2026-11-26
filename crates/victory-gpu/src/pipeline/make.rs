@@ -416,6 +416,7 @@ fn workers() -> bool {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(|| {
+                    crate::cores::worker("pipeline");
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {

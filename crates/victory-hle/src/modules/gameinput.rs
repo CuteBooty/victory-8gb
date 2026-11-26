@@ -560,6 +560,7 @@ impl Hub {
         let hub = Hub::new(source);
         hub.poll();
         std::thread::spawn(move || {
+            victory_gpu::cores::worker("input poller");
             loop {
                 std::thread::sleep(POLL);
                 hub.poll();

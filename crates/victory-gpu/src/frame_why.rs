@@ -91,7 +91,7 @@ const SUBMIT_PHASES: &[Phase] = &[
 const RELAY_PHASES: &[Phase] = &[
     Gpu, Idle, Land, CardMerge, Merge, Publish, Writes, Memory, Mapping, Other,
 ];
-// The heap worker (merged in lab-v8a-s): its pass ("prepare"), waiting for
+// The heap worker: its pass ("prepare"), waiting for
 // one ("idle"), the watch's locks.
 const HEAP_PHASES: &[Phase] = &[Prepare, Idle, Memory, Mapping, Other];
 
@@ -160,11 +160,11 @@ pub(crate) fn role(role: Role) {
 
 static SUBMIT: OnceLock<Arc<Mutex<Track>>> = OnceLock::new();
 static RELAY: OnceLock<Arc<Mutex<Track>>> = OnceLock::new();
-static OVERLAPS: Mutex<[u64; 6]> = Mutex::new([0; 6]);
+static OVERLAPS: Mutex<[u64; 7]> = Mutex::new([0; 7]);
 
 // Sample cumulative worker clocks on both edges of the present drain. This
 // measures intersection directly; separate lane totals alone cannot show it.
-fn worker_clocks() -> [u64; 6] {
+fn worker_clocks() -> [u64; 7] {
     fn snapshot(worker: &OnceLock<Arc<Mutex<Track>>>) -> [u64; N] {
         worker.get().map_or([0; N], |t| {
             let mut t = lock(t);
@@ -181,12 +181,24 @@ fn worker_clocks() -> [u64; 6] {
         r[Merge as usize],
         r[Publish as usize],
         r[Writes as usize],
+        // The submit worker's idle time inside the present's settle.
+        s[Idle as usize],
     ]
+}
+
+/// The submit worker's idle clock so far (ns; its open phase included):
+/// the heap pass's overlap with it (`crate::why_more`).
+pub(crate) fn submit_idle_ns() -> u64 {
+    SUBMIT.get().map_or(0, |t| {
+        let mut t = lock(t);
+        t.charge(Instant::now());
+        t.ns[Idle as usize]
+    })
 }
 
 pub(crate) struct PresentDrain {
     _phase: Span,
-    clocks: Option<[u64; 6]>,
+    clocks: Option<[u64; 7]>,
 }
 pub(crate) fn drain() -> PresentDrain {
     PresentDrain {
@@ -296,8 +308,8 @@ struct Window {
     worst: u64,
     worst_lanes: [[u64; N]; 3],
     lanes: [Summary; 5],
-    overlaps: [u64; 6],
-    overlap_peak: [u64; 6],
+    overlaps: [u64; 7],
+    overlap_peak: [u64; 7],
     ack: [u64; 2],
     ack_peak: [u64; 2],
     flight: u64,
@@ -403,6 +415,7 @@ pub(crate) fn frame() {
         "shadow_merge",
         "publish",
         "queued_writes",
+        "submit_idle",
     ]
     .iter()
     .enumerate()
@@ -416,6 +429,18 @@ pub(crate) fn frame() {
     .collect::<Vec<_>>()
     .join(" ");
     tracing::info!("why2 drain overlap ms avg/max {overlap}");
+    {
+        // Does the submit worker idle for want of
+        // lists while the present settles, or otherwise?
+        let idle = window.lanes[1].sum[Idle as usize];
+        let during = window.overlaps[6].min(idle);
+        tracing::info!(
+            "why2 submit worker idle ms per frame: {:.3} while the present's settle was in progress, {:.3} otherwise",
+            during as f64 / frames / 1e6,
+            (idle - during) as f64 / frames / 1e6
+        );
+    }
+    crate::why_more::log(frames);
     let worst = |lane: usize, phases: &[Phase]| {
         phases
             .iter()

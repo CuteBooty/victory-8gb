@@ -1256,8 +1256,7 @@ fn read_back(
     let bytes = pitch * (rows - 1) + row;
     let data = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("a destination outside its buffer")?;
     // The copy writes the box, not the whole footprint: only the box's
-    // rows, and only its bytes of a row, go back to the title (review of
-    // 2026-11-25, item 2).
+    // rows, and only its bytes of a row, go back to the title.
     // SAFETY: the title's box, six values, if any.
     let area = (!source_box.is_null()).then(|| unsafe { *source_box });
     let copied = match area {

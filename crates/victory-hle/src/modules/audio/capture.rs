@@ -56,6 +56,7 @@ pub fn start() {
         let _ = std::thread::Builder::new()
             .name("victory timing probe".into())
             .spawn(|| {
+                victory_gpu::cores::worker("victory timing probe");
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
                     let at = Instant::now();

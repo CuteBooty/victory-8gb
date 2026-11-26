@@ -379,6 +379,7 @@ pub(crate) fn trim() {
         return;
     }
     let work = move || {
+        crate::cores::worker("victory-library-trim");
         // SAFETY: the view lives as long as the library, which is never
         // dropped. Unlocking pages that are not locked fails, as expected,
         // and takes them out of the working set: the documented way to let

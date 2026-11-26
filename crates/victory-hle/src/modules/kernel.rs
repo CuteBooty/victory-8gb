@@ -360,6 +360,45 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+/// Preserve the native entry point, stack, security and suspended state. A runnable
+/// child may start before CreateThread returns its handle for placement.
+#[cfg(windows)]
+unsafe extern "system" fn CreateThread(
+    attributes: *const windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+    stack: usize,
+    entry: windows_sys::Win32::System::Threading::LPTHREAD_START_ROUTINE,
+    argument: *const c_void,
+    flags: u32,
+    id: *mut u32,
+) -> windows_sys::Win32::Foundation::HANDLE {
+    use std::os::windows::io::BorrowedHandle;
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    use windows_sys::Win32::System::Threading;
+    // SAFETY: forward the caller's arguments to the API with the same ABI.
+    let thread = unsafe { Threading::CreateThread(attributes, stack, entry, argument, flags, id) };
+    if !thread.is_null() {
+        // SAFETY: the caller receives this live handle on return.
+        unsafe {
+            let saved = GetLastError();
+            victory_gpu::cores::title_created(
+                BorrowedHandle::borrow_raw(thread),
+                Threading::GetThreadId(thread),
+            );
+            SetLastError(saved);
+        }
+    }
+    thread
+}
+
+#[cfg(windows)]
+pub(super) fn thread_module() -> HleModule {
+    HleModule {
+        name: "thread placement",
+        dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-processthreads-*"],
+        exports: vec![hle_export!(CreateThread)],
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",

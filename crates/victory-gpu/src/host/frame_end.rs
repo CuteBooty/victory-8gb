@@ -419,6 +419,7 @@ impl Ticket {
             std::thread::Builder::new()
                 .name("victory-frame-fence".into())
                 .spawn(move || {
+                    crate::cores::worker("victory-frame-fence");
                     let Some(host) = super::host() else { return };
                     for (t, value) in rx {
                         // SAFETY: a null event makes this call wait on the host fence.

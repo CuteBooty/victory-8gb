@@ -995,6 +995,7 @@ fn log_memory() {
     static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if memory_map() && LINES.fetch_add(1, Relaxed) % 6 == 5 && !WALKING.swap(true, Relaxed) {
         let walk = std::thread::Builder::new().name("victory-memory-map".into()).spawn(|| {
+            crate::cores::worker("victory-memory-map");
             log_memory_map();
             WALKING.store(false, Relaxed);
         });
@@ -1047,6 +1048,19 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    // Upstream VIctory #3198 (as carried in fxceless/victory-fork e4245f3c):
+    // textures the card had no room for are asked for again instead of
+    // staying without a host copy for the run.
+    let no_room = crate::resource::NOT_MADE_FOR_NOW.load(Relaxed);
+    if no_room > 0 {
+        tracing::info!(
+            "host textures the card had no room for when asked: {} times since the start, {} of them \
+             made on a later use (VICTORY_TEXTURE_ROOM_RETRY{})",
+            no_room,
+            crate::resource::MADE_AFTER_NO_ROOM.load(Relaxed),
+            if crate::resource::room_retry() { "" } else { "=0: refused for the run, as before" },
+        );
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
@@ -1088,8 +1102,13 @@ fn log_memory() {
         mb(made[5]),
     );
     tracing::info!(
-        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
-        crate::resource::placed_filler_twins()
+        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it){}",
+        crate::resource::placed_filler_twins(),
+        if crate::resource::PLACED_RAW_FULL.load(Relaxed) {
+            "; at least: counting stopped at 65536 descriptions"
+        } else {
+            ""
+        }
     );
     // What the line above leaves open: what is alive of the buffers "made
     // so far", what the windows hold and what holds them, and what our own
@@ -1666,9 +1685,11 @@ pub(crate) fn log(frames: f64) {
     }
     tracing::info!(
         "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
-         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway)",
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway), known view memory once found \
+         (VICTORY_VIEW_KNOWN=1): {:.0}",
         c[C::WatchFailed as usize],
         c[C::WatchKnownView as usize],
+        crate::watch::view_known_skips() as f64 / frames,
     );
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \

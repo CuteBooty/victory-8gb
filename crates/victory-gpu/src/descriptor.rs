@@ -938,12 +938,60 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     let len = u64::from(count) * step;
     if dst != 0 && src != 0 {
         // SAFETY: both ranges are descriptor slots the title owns.
-        unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        let same = same_records() && unsafe { records_equal(dst, src, len as usize) };
+        if !same {
+            // SAFETY: as above.
+            unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len as usize) };
+        }
         #[cfg(windows)]
         for i in 0..u64::from(count) {
             mirror(dst + i * step);
         }
     }
+}
+
+/// Whether a copy of descriptor records whose destination already holds the
+/// source's bytes is left undone (`VICTORY_SAME_RECORDS=1`; off by default).
+/// A write of the same bytes changes nothing but marks the heap's page
+/// written, and the heap sync then reads and compares the page's records
+/// (`sync_heaps`). The slots are mirrored as before (a mirror of a record
+/// made already returns at once).
+///
+/// Ported (the compare only) from trustno1-coder/VIctory-NVIDIA e8d3d918
+/// (`titlewrite::put`, avatarmanz lineage), GPL-3.0; off by default here.
+fn same_records() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAME_RECORDS").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, with [`same_records`]: record copies
+/// asked for, and those left undone as the bytes were there already.
+static SAME_RECORDS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether `[dst, dst + len)` holds the bytes of `[src, src + len)`, counted
+/// in [`SAME_RECORDS`]. (Overlapping ranges that compare equal are left as a
+/// move would leave them: the source's bytes, which are the destination's.)
+///
+/// # Safety
+/// Both ranges are readable.
+unsafe fn records_equal(dst: u64, src: u64, len: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    SAME_RECORDS[0].fetch_add(1, Relaxed);
+    // SAFETY: by the caller.
+    let same = unsafe { std::slice::from_raw_parts(dst as *const u8, len) == std::slice::from_raw_parts(src as *const u8, len) };
+    if same {
+        SAME_RECORDS[1].fetch_add(1, Relaxed);
+    }
+    same
+}
+
+/// With the frame-rate line: what [`same_records`] did per frame.
+pub(crate) fn same_records_line(frames: f64) {
+    if !same_records() {
+        return;
+    }
+    let [asked, same] = [0, 1].map(|i| SAME_RECORDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!("descriptor record copies per frame (VICTORY_SAME_RECORDS=1): {asked:.0} asked, {same:.0} left undone as the records were there already");
 }
 
 /// Device method: ranges of descriptors (start and count each) gathered
@@ -1107,6 +1155,26 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    /// Records are the same only when every byte is, overlapping or not.
+    #[test]
+    fn same_records_compares_every_byte() {
+        let mut slots: Vec<u8> = (0..96u8).collect();
+        slots[64..96].copy_from_slice(&(0..32u8).collect::<Vec<_>>());
+        let at = |i: usize| slots.as_ptr() as u64 + i as u64;
+        // SAFETY: inside `slots`.
+        unsafe {
+            assert!(records_equal(at(64), at(0), 32));
+            assert!(records_equal(at(8), at(8), 32));
+            assert!(!records_equal(at(32), at(0), 32));
+            assert!(!records_equal(at(64), at(1), 31));
+            assert!(records_equal(at(65), at(1), 31));
+        }
+        slots[95] ^= 1;
+        let at = |i: usize| slots.as_ptr() as u64 + i as u64;
+        // SAFETY: as above.
+        assert!(!unsafe { records_equal(at(64), at(0), 32) });
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.

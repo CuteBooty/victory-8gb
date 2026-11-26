@@ -906,6 +906,12 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    // Asked about already in this list: nothing to do whatever the global
+    // set says, so its lock is not taken. Nothing is
+    // noted here: the order of the look and the note below is as before.
+    if list.used(resource as usize) {
+        return;
+    }
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1012,6 +1018,7 @@ impl Staging {
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
         use std::sync::atomic::Ordering::Relaxed;
+        crate::cores::prep_job();
         let started = std::time::Instant::now();
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;

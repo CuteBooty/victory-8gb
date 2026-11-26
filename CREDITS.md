@@ -38,6 +38,8 @@ removed, and the one change below that was inspired by XCL was written anew.
 | desp | a program's constant table starts after its instructions (less NVIDIA video memory) | VIctory #2143 (`e04c0781`) |
 | Marvis | table constants read in place, through a raw view of their host copy (that part only, ported; `VICTORY_TABLE_CONSTANTS`) | upstream `683ad7a9` |
 | tjthebigbearcat-hub | mesh primitive vertex indices are 9 bits (the index mask; its tests not taken), via fork PR 1112 | upstream `c0228d9` |
+| kotekompotek | a texture the card had no room for is asked for again later instead of being refused for the run (`VICTORY_TEXTURE_ROOM_RETRY`; as carried in fork main `e4245f3c`, hand port, bounded, with its two tests) | VIctory PR #3198 |
+| RVZO6 | BCPack (BC7) channel rotation only in modes 4 and 5 (via fork main `06702fe8`, its `bcpack.rs` part, with its test) | VIctory PR #3111 |
 
 ## fxceless/victory-fork (pull requests and main)
 
@@ -111,6 +113,10 @@ removed, and the one change below that was inspired by XCL was written anew.
 | RyanCase94 | physical pages taken from sections of up to 2 MiB (`VICTORY_SECTION_MB`, default 2; idea and patch, ported) | fork issue 1089 |
 | Exopus | retries and fresh texture slots picked in turns (`VICTORY_PICK_TURNS`, off; ported) | fork PR 1246 (`faf709b5`) |
 | lichenlang89 | a raw buffer view's range stays inside its buffer, with counters (`VICTORY_RAW_VIEW_CLAMP`, on; ported) | fork PR 1266 (`dd5e8c9e`) |
+| fxceless | gather segments (`VICTORY_GATHER_SEGMENTS`, off; hand port, after flipflop877's `c69bff19`) and the clamp shader's counted table (bit 16) | fork main `e4245f3c`, `58de9bf4` |
+| fxceless | uploaded textures picked by index looked at again every n frames (`VICTORY_HEAP_RECHECK_EVERY`, off; hand port, after RyanCase94's `920423a9`) | fork main `e4245f3c` |
+| fxceless | a texture picked by index that changed after its upload looked at again next frame (`VICTORY_RECHECK_SOON`, off; from its diff); the idea of a larger cap for runs merged beside flights' writes (`VICTORY_MERGE_CAP`) | fork main `06702fe8` |
+| CwWwWwW | the texture a placed view aliases is held while the copy uses it (hand port, with its test) | fork PR 1336 (`f8fab6fb`) |
 
 ## Geckomacabre/vx-layer
 
@@ -133,6 +139,8 @@ removed, and the one change below that was inspired by XCL was written anew.
 |---|---|---|
 | RecompLive | a fresh descriptor table reserves only its used slots (adapted) | `6b44e423` |
 | RecompLive | tracked views stay dirty while any alias cannot be guarded (adapted) | `bf7a5e74` (victory #2455) |
+
+RecompLive's repository no longer resolves; the credit stands.
 
 ## triippywhale/victory-fork
 
@@ -173,6 +181,10 @@ triippywhale's fork; PalmVIDev's own repository no longer resolves.
 | myokex | a write through one view of a page is seen at its other views; code of victory-fork #115 by Spexivus, with joroyt's correction and tightfall's set of aliased blocks (VIctory #1122) | myokex/victory-amd `c6dc4d8c` |
 | ryotdev | successful input readings counted from the source of a tap | ryotdev's fork, `317d7a48` |
 | pgm1207 | no blending on integer render targets in host pipelines | pablogonz12's repository, `169efcb8` |
+| Belobug (beloooo), wardevsa | the fill light following the sky (`VICTORY_AMBIENT_SKY`, off; ported by way of wardevsa's port `0d5f6911`), and the idea of holding reflections to the light around (`VICTORY_AMBIENT_REFLECT`, off) | Belobug/VIctory-Belobug-AMD `705a2d09`, `e48eb83e`, `4f62c2a5` |
+| trustno1-coder (avatarmanz lineage) | changed runs found with AVX2 (`VICTORY_RUNS_AVX2`, without its threads); records copied onto the same bytes not written (`VICTORY_SAME_RECORDS`, the compare only); a repeated shader-write declaration recorded once (`VICTORY_DECLARE_ONCE`, there after Belobug `dd799aad` by romainhedouin); all off | trustno1-coder/VIctory-NVIDIA `b6202840`, `e8d3d918`, `b32fb997` |
+| Jake | cache enumeration and thread placement by last-level cache group (`VICTORY_CORE_PLAN`, off; adapted) | avatarmanz/VIctory-7900XTX `7c3d839c` |
+| avatarmanz/VIctory-7900XTX authors | renderer port 6, followed in code written anew: the guards' lock shared with per-block claims (`VICTORY_PORT_GUARD`), view memory left out of write-watch askings (`VICTORY_VIEW_KNOWN`), the prep pool's look at refreshes that copy nothing; and the standing skip (`VICTORY_STANDING_SKIP`, modelled on `2aa8134b`); all off | avatarmanz/VIctory-7900XTX `9d723e88`, `2edf8446`, `88b63a2c`, `65f9707d`, `00ab2acf`, `2aa8134b` |
 
 ## Written for this tree
 
@@ -232,6 +244,17 @@ UwUCammie's release of buffer-pass copies with their descriptor heap
 (avatarmanz/VIctory-7900XTX dd67ae73; `VICTORY_SAMPLER_HEAP_FULL`).
 These were written with Claude Code (Claude Opus and Claude Fable models)
 and OpenAI Codex.
+
+Written for this tree since the fifth snapshot: the hand ports named above
+(gather segments and the counted clamp table, the texture room retry, the
+periodic and early texture rechecks, the alias pin of fork PR 1336, the sky
+fill light, the AVX2 runs, same-record and declare-once skips, thread
+placement, renderer port 6's shared guards lock); and our own: the guards'
+lock let go between chunks (`VICTORY_GUARD_CHUNK`), the heap pass's same-slot
+skip (`VICTORY_HEAP_SAME_SKIP`), the present's copy as a flight
+(`VICTORY_PRESENT_FLIGHT`), the queues woken first (`VICTORY_WAKE_FIRST`),
+mutable indirect sources clamped at the draw (`VICTORY_GATHER_STRICT`), and
+more `VICTORY_FRAME_WHY2` lines, with Claude Code and OpenAI Codex.
 
 Several contributors' own commits also say they were written with AI
 assistance (Claude Code, OpenAI Codex); commits in triippywhale's fork carry

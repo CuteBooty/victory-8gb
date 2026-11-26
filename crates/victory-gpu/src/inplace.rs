@@ -1249,6 +1249,7 @@ pub(crate) fn tick() {
     if due {
         let which = DONE.fetch_add(1, Ordering::Relaxed);
         std::thread::spawn(move || {
+            crate::cores::worker("in-place census");
             let spans = crate::shadow::spans();
             for line in census_of(&spans) {
                 tracing::info!("in place {line}");

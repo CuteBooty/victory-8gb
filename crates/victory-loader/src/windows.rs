@@ -402,6 +402,7 @@ impl LoadedImage {
             .name("title-main".into())
             .stack_size(stack)
             .spawn(move || {
+                crate::threads::place_thread("title-main");
                 for (name, dll) in &dlls {
                     // SAFETY: forwarded from the caller of `spawn_main`.
                     unsafe { dll.attach() }.with_context(|| format!("attaching {name}"))?;

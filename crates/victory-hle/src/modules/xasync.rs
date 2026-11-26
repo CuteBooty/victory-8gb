@@ -104,6 +104,7 @@ impl Port {
             // using the port is closed) and nothing is left to run.
             let worker = port.clone();
             std::thread::spawn(move || {
+                victory_gpu::cores::worker("serialized task port");
                 loop {
                     match worker.take(1000, || false) {
                         Some(task) => task.run(false),
@@ -173,6 +174,7 @@ impl Pool {
     }
 
     fn work(&self) {
+        victory_gpu::cores::worker("task pool");
         let mut state = lock(&self.state);
         loop {
             while state.0.is_empty() {
@@ -219,6 +221,7 @@ impl Queue {
         } else {
             let queue = self.clone();
             std::thread::spawn(move || {
+                victory_gpu::cores::worker("delayed task");
                 std::thread::sleep(Duration::from_millis(delay_ms.into()));
                 queue.deliver(port, task);
             });
@@ -774,6 +777,7 @@ pub fn pending_with(
                 let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
                 let (block, state) = (data.block as usize, state as usize);
                 std::thread::spawn(move || {
+                    victory_gpu::cores::worker("pending async work");
                     let result = work.map_or(Err(E_ABORT), |work| work());
                     let (hr, len) = match &result {
                         Ok(bytes) => (S_OK, bytes.len()),
