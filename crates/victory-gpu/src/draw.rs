@@ -4163,6 +4163,7 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        use crate::indirect::{StrictAt, stable_source};
         // Skip before the argument clamp can mutate the indirect buffer.
         if crate::pipeline::is_skipped(self.pipeline as This) {
             #[cfg(feature = "diagnostics")]
@@ -4257,7 +4258,7 @@ impl State {
             // here on (`crate::indirect::gather`).
             list.gather_close();
         }
-        let windowed = windowed && crate::indirect::stable_source(&args);
+        let windowed = windowed && stable_source(&args, StrictAt::WindowCandidate);
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         if !windowed || list.new_indirect_window() {
@@ -4272,7 +4273,11 @@ impl State {
             .map(|w| (w.scratch.clone(), offset - w.base, w.records > 1));
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers (`crate::indirect::gathers`).
-        let gathered = if hit.is_none() && windowed && crate::indirect::gathers() {
+        let gathered = if hit.is_none()
+            && windowed
+            && crate::indirect::gathers()
+            && stable_source(&args, StrictAt::GatherMiss)
+        {
             crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride))
         } else {
             None

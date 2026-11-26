@@ -515,12 +515,23 @@ pub(crate) fn gathers() -> bool {
     })
 }
 
-/// In-place arguments can change under the card. A shared copy can also
-/// be refreshed or merged by another submission while the card reads it.
-/// Neither source can be clamped ahead of its draw.
-pub(crate) fn stable_source(src: &crate::shadow::Shadow) -> bool {
-    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*STRICT.get_or_init(|| std::env::var_os("VICTORY_GATHER_STRICT").is_none_or(|v| v != "0")) {
+#[derive(PartialEq)]
+pub(crate) enum StrictAt {
+    Off,
+    GatherMiss,
+    WindowCandidate,
+}
+
+/// By default only check a window miss considered for a prelude or segment.
+/// Mode 2 checks earlier, before window lookup, which also covers gathers.
+pub(crate) fn stable_source(src: &crate::shadow::Shadow, at: StrictAt) -> bool {
+    static STRICT: std::sync::OnceLock<StrictAt> = std::sync::OnceLock::new();
+    let strict = STRICT.get_or_init(|| match std::env::var("VICTORY_GATHER_STRICT").as_deref() {
+        Ok("0") => StrictAt::Off,
+        Ok("2") => StrictAt::WindowCandidate,
+        _ => StrictAt::GatherMiss,
+    });
+    if *strict != at {
         return true;
     }
     let reason = if src.in_place() {
@@ -531,6 +542,9 @@ pub(crate) fn stable_source(src: &crate::shadow::Shadow) -> bool {
         return true;
     };
     GATHER_DEMOTED[reason].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if at == StrictAt::WindowCandidate {
+        DEMOTED_WINDOW.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     false
 }
 
@@ -793,6 +807,8 @@ pub(crate) static GATHER_NONE: [std::sync::atomic::AtomicU64; 5] = [const { std:
 /// Since the last line: draws that read a gathered record.
 static GATHERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GATHER_DEMOTED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Window candidates rejected by mode 2, also counted under their reason above.
+static DEMOTED_WINDOW: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// The line of [`gather`]'s counts (every five seconds, with the switch on).
 pub(crate) fn gather_line() {
@@ -800,10 +816,12 @@ pub(crate) fn gather_line() {
     let gathered = GATHERED.swap(0, Relaxed);
     let none = GATHER_NONE.each_ref().map(|n| n.swap(0, Relaxed));
     let [demoted_in_place, demoted_shared_in_flight] = GATHER_DEMOTED.each_ref().map(|n| n.swap(0, Relaxed));
-    if gathered > 0 || none.iter().any(|&n| n > 0) || demoted_in_place > 0 || demoted_shared_in_flight > 0 {
+    let demoted_window = DEMOTED_WINDOW.swap(0, Relaxed);
+    if gathered > 0 || none.iter().any(|&n| n > 0) || demoted_in_place > 0 || demoted_shared_in_flight > 0 || demoted_window > 0 {
         tracing::info!(
             demoted_in_place,
             demoted_shared_in_flight,
+            demoted_window,
             "indirect records gathered for their list's prelude: {gathered} draws read one; \
              no slot: no fit for the clamp {}, the list had stopped gathering {}, too many buffers {}, the set full {}, no buffer {}",
             none[0],

@@ -45,11 +45,13 @@ switches in the table below. One PC; your numbers will differ.
 - Longest session: 104 minutes on 2026-11-25, without a crash and with 0
   logged errors; the first Chapter I mission was played through and saved by
   hand.
-- 2026-11-26: 34 runs, 0 logged errors, no device loss, no crash.
-- Frame times of 2026-11-26 with the recommended set, as medians of the log's
-  5-second lines by draws per frame: 1,000-3,000 draws about 120-130 ms;
-  5,000-7,000 about 205-210 ms; 7,000-9,000 about 220-240 ms; 9,000-11,000
-  about 230-280 ms. On this machine the dense frame is mostly CPU time.
+- 2026-11-26: 43 runs, 0 logged errors, no device loss, no crash.
+- Frame times on the reference scene (afternoon, parking lot, recommended
+  set), as medians of the log's 5-second lines by draws per frame: 205-215 ms
+  at 7,000-9,000 draws, about 140 ms at 3,000-5,000 and about 115-120 ms at
+  1,000-3,000. Night scenes are flatter (the fill light). The picture is low
+  resolution, with weak edge anti-aliasing on thin geometry (power lines,
+  leaves). On this machine the dense frame is mostly CPU time.
 
 ## New in the first snapshot (compared with the fork it is based on)
 
@@ -304,6 +306,33 @@ marked "always on" or "on". Sources are in CREDITS.md.
   of the frame (guard lock, write watch, heap pass, queues, thread placement,
   ambient light), all off; see the switch table.
 
+## What changed since the sixth snapshot
+
+- **A speed regression of the sixth snapshot is fixed.** The sixth snapshot
+  (a4b6ebd6) was about 65-75 ms a frame slower in dense scenes with the
+  recommended switches: its new safety rule (`VICTORY_GATHER_STRICT`) also
+  demoted indirect-window draws (`VICTORY_INDIRECT_WINDOW=1`), sending them
+  back to one clamp pass per record. This snapshot applies the rule by
+  default only to records considered for the prelude gather and for
+  segments; `VICTORY_GATHER_STRICT=2` also applies it to window hits, as
+  before, and the gather line counts those as `demoted_window`.
+- If you stay on the sixth snapshot: set `VICTORY_GATHER_STRICT=0`, and then
+  do not use `VICTORY_INDIRECT_GATHER`.
+
+Medians of the log's 5-second lines at 7,000-9,000 draws, same settings, same
+day (one save, one PC, short runs):
+
+| Build | ms a frame | Lines |
+|---|---|---|
+| before the safety rule | 208 | 5 |
+| an older build, also without the rule | 210 | 14 |
+| sixth snapshot, rule on window hits | 276 | 25 |
+| sixth snapshot, rule on window hits (second run) | 285 | 7 |
+| sixth snapshot with `VICTORY_GATHER_STRICT=0` | 203 | 11 |
+| this snapshot | 215 | 5 |
+
+The picture was the same in all of them.
+
 ## Known problems
 
 - Slow (see the frame times above).
@@ -420,9 +449,9 @@ Defaults as the code reads them. "On" switches are turned off with `=0`;
 | `VICTORY_WATCH_SPLIT` | off | the kernel's write-watch query runs under per-region locks instead of the journal's lock |
 | `VICTORY_DESC_DIRTY` | off | `1`: descriptor records on pages not written since the last pass are not compared (write-watched memory only); `2`: also guarded view memory (not yet run); `VICTORY_DESC_DIRTY_CHECK=<n>` samples skipped ranges |
 | `VICTORY_SAMPLER_HEAP_FULL` | off | host sampler heaps are made with 2,048 slots, the last a null sampler (not yet run) |
-| `VICTORY_INDIRECT_GATHER` | off | experimental, `=1`: single indirect records that miss their window are clamped together in their list's prelude (needs `VICTORY_INDIRECT_WINDOW=1`). Measured 237 -> 218 ms at 7,000-9,000 draws before the safety rule below; with `VICTORY_GATHER_STRICT` about half the records fall back and most of the card saving is lost (220 ms in one run) |
-| `VICTORY_GATHER_STRICT` | on | with gather, a record whose source can still change under the card (in-place arguments, or a copy not on the card while submissions are in flight) is clamped at its draw instead; `=0` gathers them anyway (unsafe) |
-| `VICTORY_GATHER_SEGMENTS` | off | experimental, `=1` (`=alt` in turns), needs gather: after a list stops gathering, records are clamped in segments, one pass each; removes the "list had stopped gathering" fallbacks; no frame gain shown on this CPU |
+| `VICTORY_INDIRECT_GATHER` | off | experimental, `=1`: single indirect records that miss their window are clamped together in their list's prelude (needs `VICTORY_INDIRECT_WINDOW=1`). Measured before the safety rule below existed: 237 ms plain -> 218 with gather -> 210 with gather and segments, at 7,000-9,000 draws. With the safety rule about half the records fall back; gather with the rule has not been re-measured since the fix in the seventh snapshot |
+| `VICTORY_GATHER_STRICT` | `1` | a record whose source can still change under the card (in-place arguments, or a copy not on the card while submissions are in flight) is clamped at its draw instead. Unset or `=1`: only records considered for the gather and for segments; `=2`: also indirect-window hits (the sixth snapshot's behaviour, slower); `=0`: off (unsafe with gather) |
+| `VICTORY_GATHER_SEGMENTS` | off | experimental, `=1` (`=alt` in turns), needs gather: after a list stops gathering, records are clamped in segments, one pass each; removes the "list had stopped gathering" fallbacks (see `VICTORY_INDIRECT_GATHER` for the figure measured before the safety rule) |
 | `VICTORY_TEXTURE_ROOM_RETRY` | on | a texture the card had no room for is tried again after a second instead of being refused for the run, at most `VICTORY_TEXTURE_ROOM_RETRY_PER_S` (default 8) a second; `=0` restores the old way. Not yet exercised in our runs |
 | `VICTORY_MERGE_CAP` | 512 | `=<runs>`: the most changed runs merged beside flights' writes in a submission before it settles instead |
 | `VICTORY_RECHECK_SOON` | off | a texture picked by index that changed after its upload is looked at again in the next frame, not four frames later |
