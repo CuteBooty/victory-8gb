@@ -2405,6 +2405,16 @@ impl State {
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
         let most = (4000 / took).clamp(16, 256);
+        // Remaps already wake these slots. With alternating picks allow a
+        // longer interval for polls, keeping the card-full backoff separate.
+        let relook = if crate::descriptor::host::pick_turns() {
+            static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let ms = *MS.get_or_init(|| std::env::var("VICTORY_RELOOK_MS").ok()
+                .and_then(|v| v.trim().parse().ok()).unwrap_or(20_000));
+            (ms / took).clamp(16, 1024)
+        } else {
+            most
+        };
         // What a table entry of a texture a shader samples says.
         let sampled = UsedResource {
             kind: ResourceType::Srv,
@@ -2500,13 +2510,13 @@ impl State {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     // Streamed out: what the slot showed is let go.
                     host.texture_slot_gone(index);
-                    host.texture_slot_later(index, write, frame, most);
+                    host.texture_slot_later(index, write, frame, relook);
                     continue;
                 }
                 if mapped < len {
                     if mapped <= host.texture_slot_mapped(index) {
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
+                        host.texture_slot_later(index, write, frame, relook);
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {

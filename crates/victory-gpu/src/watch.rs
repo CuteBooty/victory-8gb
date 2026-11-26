@@ -235,6 +235,59 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// Write a merged stretch in one shadow page. Only its originating shadow
+/// may advance its copy stamp. Every other reader sees the journal write,
+/// including readers served by a standing submission asking.
+pub(crate) fn quiet_copy_back(_mapping: &Reading, at: usize, bytes: &[u8], copied: &mut u64) -> bool {
+    use windows_sys::Win32::System::Memory::{GetWriteWatch, ResetWriteWatch};
+    let page = at / PAGE;
+    if *copied == 0 || bytes.is_empty() || bytes.len() > PAGE - at % PAGE {
+        return false;
+    }
+    let first = at & !(KERNEL_PAGE - 1);
+    let end = (at + bytes.len()).next_multiple_of(KERNEL_PAGE);
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    if j.written.get(&page).is_some_and(|&w| w > *copied) {
+        return false;
+    }
+    let mut found = [std::ptr::null_mut(); PAGE / KERNEL_PAGE];
+    let mut count = found.len();
+    let mut granularity = 0;
+    // A successful non-resetting query identifies private write-watched
+    // memory. An existing title write anywhere on the kernel pages stays.
+    let query = unsafe {
+        GetWriteWatch(0, first as _, end - first, found.as_mut_ptr(), &mut count, &mut granularity)
+    };
+    if query != 0 || count != 0 || granularity as usize != KERNEL_PAGE {
+        return false;
+    }
+    // Keep the ordinary guard and placed-texture invalidations. Do not
+    // call write_texture here: it would take the journal lock again.
+    open(&mut guards(), at, at + bytes.len());
+    let (ok, done) = crate::host::write_bytes_once(at, bytes);
+    if done != 0 {
+        j.asked += 1;
+        let now = j.asked;
+        j.written.insert(page, now);
+        if j.kept || !j.ahead.is_empty() {
+            j.ahead_asked = now;
+        }
+        crate::descriptor::host::remapped(at, done);
+    }
+    if !ok || done != bytes.len() {
+        return false; // Ordinary write retries; keep every dirty bit.
+    }
+    // A concurrent CPU store on these same 4 KiB pages between the query
+    // and reset can lose its bit. The journal serializes its pollers, but
+    // the mapping hold cannot exclude a title store (fork PR 1188, opt-in).
+    if unsafe { ResetWriteWatch(first as _, end - first) } != 0 {
+        // Already written and journaled. Keep this shadow stale too.
+        return true;
+    }
+    *copied = j.asked;
+    true
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
@@ -1794,6 +1847,22 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
+        {
+            let at = p + PAGE;
+            let mapping = title_memory_reading(at, PAGE);
+            let mut stamp = later;
+            assert!(quiet_copy_back(&mapping, at + 8, &[2], &mut stamp));
+            assert!(stamp > later);
+            assert_eq!(writes(at, at + PAGE, false).unwrap().1, [(at / PAGE, stamp)]);
+            // A title store outside the merged bytes on the same kernel
+            // page must survive both the probe and the next journal poll.
+            unsafe { ((at + 9) as *mut u8).write(3) };
+            assert!(!quiet_copy_back(&mapping, at + 8, &[4], &mut stamp));
+            assert_eq!(unsafe { ((at + 8) as *const u8).read() }, 2);
+            let (_, after) = writes(at, at + PAGE, false).unwrap();
+            assert!(after[0].1 > stamp);
+            assert!(!quiet_copy_back(&mapping, at + 8, &[4], &mut stamp));
+        }
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(

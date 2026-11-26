@@ -31,8 +31,7 @@ switches in the table below.
 - Frame times, as medians of the 5-second log lines: open water about
   141-168 ms (6-7 fps); medium scenes with 4,400-7,000 draws 180-250 ms;
   heavy scenes (town, dense foliage, 7,000-10,000 draws) 240-340 ms (3-4 fps).
-- The newest build in this snapshot has had eight short runs (six of this exact build), without a crash
-  or an error, with the optional switches listed below the table.
+- The newest build has had three short runs, without a crash or an error.
 
 ## New in the first snapshot (compared with the fork it is based on)
 
@@ -48,7 +47,7 @@ switches in the table below.
 - Descriptor heap lock split (fork PR #1146).
 - Series S profile (fork PR #188).
 
-## What changed since the first snapshot
+## What changed in the second snapshot (since the first)
 
 All new behaviour is behind switches (see "Switches added since the first
 snapshot" below), and each one that is on by default can be turned off.
@@ -87,16 +86,50 @@ runs each, so weak evidence):
   slower in play. The recommended value stays 2.
 - 1280x720 output did not reduce card time and is not recommended.
 
+## What changed since the second snapshot
+
+- The title's physical memory is now taken from sections of up to 2 MiB
+  instead of one section per request (the idea and patch from fork issue
+  1089, ported). On by default; `VICTORY_SECTION_MB=0` restores the old way.
+- Two ports as switches, off by default and not measured here: copy-backs
+  into write-watched memory are no longer mistaken for title writes
+  (`VICTORY_BACK_QUIET`, fork PR 1188; its known race: a title write to the
+  same 4 KiB page between the query and the reset can be missed), and
+  texture retries and fresh texture slots are picked in turns
+  (`VICTORY_PICK_TURNS`, fork PR 1246).
+- A read-back age probe (`VICTORY_BACK_LATCH`, off): counters only, for
+  diagnosis; it changes no behaviour.
+- `VICTORY_AMBIENT=0.6` and the three copy and binding switches that were
+  optional before are now part of the recommended set below.
+
+Measured on the test machine (5-second log lines; weak evidence):
+
+- With 2 MiB sections, the texture refresh's wait on the title's memory
+  remaps fell from 37 ms a frame on average (single waits up to 816 ms; 68 of
+  228 samples over 20 ms) to about 1 ms (worst 28 and 62 ms; 1 sample over
+  20 ms in each of two runs, of 314 and 331 samples).
+- Heavy frames at 7,000-9,000 draws were 232 ms in the first of those two
+  runs (the second ran while a screen recorder was recording and is not
+  comparable).
+- In play, the half-second freezes while driving were judged gone ("pretty
+  decent feel").
+- `VICTORY_AMBIENT=0.6`: shaded areas are no longer pure black; judged "a lot
+  better" in play. Its cost in frame time is not measured yet (the one run
+  with it was short and recorded).
+- No gain in steady frame time over the earlier snapshots is proven.
+
 ## Known problems
 
 - Slow (see the frame times above).
 - The picture's exposure flashes unless `VICTORY_LATE_WAIT=2` is set; that
   wait costs 70-90 ms a frame in heavy scenes.
-- Stalls while the texture refresh waits for title memory to stop moving.
+- Hitches while driving. The texture refresh's wait for the title's memory
+  remaps is gone with the default 2 MiB sections; other hitches remain, and
+  their cause is not yet found.
 - With `VICTORY_BAKE_TEXTURES_MS=0`, characters can be baked dark at first.
-- Shaded areas can be black: bounced light does not run. They are still
-  black in this snapshot (`VICTORY_AMBIENT`, which adds a least amount of
-  indirect light, was not tested here).
+- Shaded areas are black without `VICTORY_AMBIENT`: the title's bounced light
+  does not run. `VICTORY_AMBIENT=0.6` covers it with a constant fill, the
+  same everywhere; real bounced light still does not run.
 - Foliage looks dotted in Series S.
 - Eight compute programs are refused by the translator.
 - No autosave was seen during a mission.
@@ -126,15 +159,18 @@ in a comment where the code reads it.
 | `VICTORY_LATE_WAIT=2` | submissions go to the card without a wait for each and are settled together where the title can observe them; at stage 2, bytes the title changed under a flight's writes are merged in instead of settling the flights |
 | `VICTORY_BACK_SETTLE=0` | a present sent ahead waits only for flights that copy shader-written textures back, not for every flight that copies small results back to title memory; it applies only when the present is sent ahead (`VICTORY_LATE_WAIT` 3 or the relay), since at stage 2 the present waits for everything; set explicitly, it also keeps the present off `VICTORY_FRAME_FEEDBACK=2`'s policy |
 | `VICTORY_LAND_ASIDE=1` | the command lists of landed flights are reset on a thread of their own instead of at the end of each submission (off by default) |
+| `VICTORY_COPY_PLAIN=1` | copies of title memory into host buffers are made in place by this process, with the kernel's copy behind them for a page that is not there |
+| `VICTORY_FILLS_PLAIN=1` | a list's fills of under 256 bytes are copied in place instead of through the kernel's copy (needs `VICTORY_COPY_PLAIN=1`) |
+| `VICTORY_REUSE_TARGET_BINDS=1` | repeated bindings of the same output targets are skipped |
+| `VICTORY_AMBIENT=0.6` | where the title's ray-traced light probes would supply bounced light (they do not run here), a constant least amount of indirect light is used instead, the same everywhere; it is not real bounced light |
 
 If materials look wrong, `VICTORY_TABLE_CONSTANTS=0` turns off reading table
 constants in place: every table constant is then copied for the draw into
 upload memory, as before (more descriptor slots, slower).
 
-Optional, on top of the table: `VICTORY_FILLS_PLAIN=1`, `VICTORY_COPY_PLAIN=1`
-and `VICTORY_REUSE_TARGET_BINDS=1`. They were set in every run of the newest
-build and its two predecessors (eight short runs, no crash, no errors); no frame-time gain from them is
-proven.
+`VICTORY_FILLS_PLAIN=1`, `VICTORY_COPY_PLAIN=1` and
+`VICTORY_REUSE_TARGET_BINDS=1` have been set in the recent runs without a
+crash; no frame-time gain from them is proven.
 
 ### Switches added since the first snapshot
 
@@ -160,6 +196,11 @@ Defaults as the code reads them. "On" switches are turned off with `=0`;
 | `VICTORY_FRAME_END_WHY` | off | with `VICTORY_LATE_WAIT` 2 or 3, a 5-second line of what the present waits for (diagnostic) |
 | `VICTORY_SOURCE_DIFF` | off | with guarded copies (the default copy mode), a census of how many source bytes really changed (diagnostic) |
 | `VICTORY_INPUT_WHY` | off | logs each button edge the title is given, with its source (diagnostic) |
+| `VICTORY_SECTION_MB` | 2 | the title's physical pages come from sections of up to this many MiB; `0`: one section per request, as before |
+| `VICTORY_BACK_QUIET` | off | copy-backs into write-watched memory are not read as title writes (known race: a title write to the same 4 KiB page between the query and the reset can be missed) |
+| `VICTORY_PICK_TURNS` | off | texture retries and fresh texture slots are picked in turns |
+| `VICTORY_BACK_LATCH` | off | 5-second counters of how old read-backs are when the present returns (diagnostic; changes no behaviour) |
+| `VICTORY_AMBIENT` | off | a constant least amount of indirect light in place of the title's bounced light; `=<level>` sets it (0.6 recommended, `0` is none, an unreadable value means 0.6) |
 
 ## Building
 

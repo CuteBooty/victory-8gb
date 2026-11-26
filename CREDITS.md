@@ -107,6 +107,9 @@ removed, and the one change below that was inspired by XCL was written anew.
 | spk | merged write intervals compacted in place (ported) | fork PR 1232 (`9a04be5a`) |
 | Kyle Soderlund | a thread remembers what its asks for a buffer's host copy found (`VICTORY_LOOKUP_CACHE`; ported) | fork PR 1237 (`cdf74b56`) |
 | fxceless | a list's fills of under 256 bytes copied in place (`VICTORY_FILLS_PLAIN`, off; ported) | fork main `de4146a0` |
+| Yorivel | copy-backs into write-watched memory not read as title writes (`VICTORY_BACK_QUIET`, off; ported) | fork PR 1188 (`0460bf53`) |
+| RyanCase94 | physical pages taken from sections of up to 2 MiB (`VICTORY_SECTION_MB`, default 2; idea and patch, ported) | fork issue 1089 |
+| Exopus | retries and fresh texture slots picked in turns (`VICTORY_PICK_TURNS`, off; ported) | fork PR 1246 (`faf709b5`) |
 
 ## Geckomacabre/vx-layer
 
@@ -205,6 +208,10 @@ for tagged read-backs (`VICTORY_LATE_WAIT=3`, `VICTORY_LATE_SET`); and input
 work: stale latched and queued presses dropped
 (`VICTORY_LATCH_DROP_STALE`), and a trace of the button edges the title is
 given (`VICTORY_INPUT_WHY`).
+
+Written for this tree since the second snapshot: the hand ports of fork PRs
+1188 and 1246 and of fork issue 1089 named above; and a read-back age probe
+(`VICTORY_BACK_LATCH`, off; counters only, it changes no behaviour).
 
 Several contributors' own commits also say they were written with AI
 assistance (Claude Code, OpenAI Codex); commits in triippywhale's fork carry

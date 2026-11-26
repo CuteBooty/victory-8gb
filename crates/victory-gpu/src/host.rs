@@ -19,6 +19,7 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+pub(crate) mod back_age;
 pub(crate) mod feedback;
 pub(crate) mod frame_end;
 
@@ -3991,7 +3992,9 @@ fn read_backs(list: &HostList, ticket: Option<(&frame_end::Ticket, usize)>) {
         t.copy_done(i, 0, None);
     }
     for (op, back) in deferred.texture_backs.iter().enumerate() {
+        let probe = back_age::begin_copy(back_age::TILED, back.span(), deferred.submitted_at);
         let ok = back.land();
+        if let Some(probe) = probe { probe.finish(ok); }
         if let Some((t, i)) = ticket {
             t.copy_done(i, op + 1, (!ok).then(|| back.span()));
         }
@@ -4003,6 +4006,7 @@ fn read_backs(list: &HostList, ticket: Option<(&frame_end::Ticket, usize)>) {
         crate::texback::landed_after_present(deferred.texture_backs.len() as u64);
     }
     for (op, (buffer, at, [row, rows, pitch], extent)) in deferred.backs.iter().enumerate() {
+        let probe = back_age::begin_copy(feedback::footprint_kind(*extent), (*at, at.saturating_add(*row)), deferred.submitted_at);
         let mut data = std::ptr::null_mut();
         // SAFETY: a read-back buffer of ours, written by the list that has
         // run; the title's destination holds every row (checked when the
@@ -4034,6 +4038,7 @@ fn read_backs(list: &HostList, ticket: Option<(&frame_end::Ticket, usize)>) {
                 }
                 buffer.Unmap(0, None);
             }
+            if let Some(probe) = probe { probe.finish(mapped); }
             if let Some((t, i)) = ticket {
                 let failure = (!mapped).then(|| (*at, at.saturating_add(rows.saturating_sub(1) * pitch).saturating_add(*row)));
                 t.copy_done(i, deferred.texture_backs.len() + op + 1, failure);
@@ -6646,7 +6651,9 @@ impl HostList {
     /// The title submits the list now (diagnostic stamp, [`read_backs`]).
     pub(crate) fn mark_submitted(&self) {
         let deferred = self.deferred();
-        if !deferred.texture_backs.is_empty() || (feedback::enabled() && !deferred.backs.is_empty()) {
+        if back_age::enabled() && (!deferred.texture_backs.is_empty() || !deferred.backs.is_empty()) {
+            back_age::register(deferred);
+        } else if !deferred.texture_backs.is_empty() || (feedback::enabled() && !deferred.backs.is_empty()) {
             deferred.submitted_at = crate::queue::presents_done() + 1;
         }
     }
@@ -8281,10 +8288,15 @@ pub(crate) fn copy_title(dst: usize, src: usize, len: usize) -> bool {
 /// (what it took is left as it is, not tried again).
 pub(crate) fn write_texture(at: usize, tiled: &[u8]) -> bool {
     crate::watch::writing(at, tiled.len());
-    let (ok, done) = write_once(at as *mut u8, tiled.as_ptr(), tiled.len(), direct_writes());
+    let (ok, done) = write_bytes_once(at, tiled);
     // Refreshes that follow see these pages as written.
     crate::watch::wrote(at, done);
     ok && done == tiled.len()
+}
+
+/// Checked kernel write for callers that manage guards and the journal.
+pub(crate) fn write_bytes_once(at: usize, bytes: &[u8]) -> (bool, usize) {
+    write_once(at as *mut u8, bytes.as_ptr(), bytes.len(), direct_writes())
 }
 
 /// Our own write of `len` bytes from `src` into title memory at `dst` (what
@@ -8608,6 +8620,7 @@ impl Meter {
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             frame_end::log_interval();
+            back_age::log_interval();
             feedback::log_interval();
             crate::texback::log_interval();
             crate::draw::bake_flush_line();

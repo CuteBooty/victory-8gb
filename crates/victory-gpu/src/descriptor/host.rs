@@ -437,6 +437,13 @@ struct Waiting {
 /// Ranges of a texture's memory (offsets, bytes) read for its fingerprint.
 pub(crate) type Mips = std::sync::Arc<[(u64, u64)]>;
 
+/// Alternate retries with first looks. Retry age within its class is
+/// unbounded under sustained arrivals, so keep the experiment opt-in.
+pub(crate) fn pick_turns() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PICK_TURNS").is_some_and(|v| v == "1"))
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -475,6 +482,8 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     ///
+    /// With `turns` the two groups alternate, starting with a retry.
+    ///
     /// Also counts all slots, as the frame line needs the whole backlog:
     /// queued, due, waiting for memory, partly uploaded, and the age in
     /// frames of the oldest due write.
@@ -482,7 +491,7 @@ impl TextureQueue {
     /// `room`: whether the card has room for new textures; without it a
     /// slot refused lately ([`TextureQueue::full`]) is left out of the
     /// order (not of the counts), so the slots behind it get their turn.
-    fn due_for(&self, frame: u64, max: usize, room: bool) -> (Vec<(u32, u64)>, [u64; 5]) {
+    fn due_for(&self, frame: u64, max: usize, room: bool, turns: bool) -> (Vec<(u32, u64)>, [u64; 5]) {
         let mut counts = [self.slots.len() as u64, 0, 0, 0, 0];
         let mut again = Vec::new();
         let mut fresh = Vec::new();
@@ -505,7 +514,9 @@ impl TextureQueue {
                 }
             }
         }
-        let retries = again.len().min(max);
+        // A retry leads each pair. Fill unused places from either class.
+        let reserved_fresh = if turns { fresh.len().min(max / 2) } else { 0 };
+        let retries = again.len().min(max - reserved_fresh);
         let first_retry = again.len() - retries;
         let by_write = |&(write, _): &(u64, u32)| write;
         if first_retry > 0 {
@@ -515,7 +526,10 @@ impl TextureQueue {
         again.sort_unstable_by_key(by_write);
         let fresh_count = fresh.len().min(max - retries);
         let mut order = Vec::with_capacity(retries + fresh_count);
-        order.extend(again.iter().rev().map(|&(write, index)| (index, write)));
+        let mut retry = again.iter().rev().map(|&(write, index)| (index, write));
+        if !turns || fresh_count == 0 {
+            order.extend(retry.by_ref());
+        }
         if fresh_count == 0 {
             return (order, counts);
         }
@@ -537,17 +551,20 @@ impl TextureQueue {
         }
         let mut oldest = fresh[..oldest_count].iter();
         for &(write, index) in fresh[newest_start..].iter().rev() {
+            order.extend(retry.next());
             order.push((index, write));
             if let Some(&(write, index)) = oldest.next() {
+                order.extend(retry.next());
                 order.push((index, write));
             }
         }
+        order.extend(retry);
         (order, counts)
     }
 
     #[cfg(test)]
     fn due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
-        self.due_for(frame, max, true)
+        self.due_for(frame, max, true, false)
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -1589,7 +1606,7 @@ impl HostHeap {
     /// has room for new textures).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize, room: bool) -> (Vec<(u32, u64)>, [u64; 5]) {
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.due_for(frame, max, room)
+        textures.due_for(frame, max, room, pick_turns())
     }
 
     /// Every title slot of the queue that is due at `frame`, and whether
@@ -4068,7 +4085,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         let mut seen = [false; 4];
         for frame in 3..12u64 {
             let mut refused = 0;
-            for (index, write) in q.due_for(frame, 4096, false).0 {
+            for (index, write) in q.due_for(frame, 4096, false, false).0 {
                 if let Some(at) = [1, 50, 1200, 100].iter().position(|&s| s == index) {
                     seen[at] = true;
                     q.done(index, write);
@@ -4082,7 +4099,26 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             }
         }
         assert_eq!(seen, [true; 4], "recheck, remapped, middle, last retry");
-        assert_eq!(q.due_for(12, 4096, true).0.len(), 698);
+        assert_eq!(q.due_for(12, 4096, true, false).0.len(), 698);
+    }
+
+    #[test]
+    fn the_texture_queue_serves_looked_at_and_fresh_slots_in_turns() {
+        let mut q = TextureQueue::default();
+        for i in 0..10 {
+            q.written(100 + i, 1, 0, false);
+            q.later(100 + i, u64::from(i) + 1, 1, 1);
+        }
+        for i in 1..4 {
+            q.written(i, 2, 0, false);
+        }
+        let expected = [109, 3, 108, 1, 107, 2, 106, 105, 104, 103, 102, 101, 100];
+        for max in 0..=expected.len() + 1 {
+            let (order, counts) = q.due_for(10, max, true, true);
+            let slots: Vec<_> = order.into_iter().map(|d| d.0).collect();
+            assert_eq!(slots, expected[..max.min(expected.len())]);
+            assert_eq!(counts, [13, 13, 10, 0, 9]);
+        }
     }
 
     #[test]

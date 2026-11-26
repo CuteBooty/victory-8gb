@@ -2857,7 +2857,7 @@ extern "system" fn resource_release(this: This) -> u32 {
 /// still landing, even when the caller already has its pointer.
 extern "system" fn map(this: This, _sub: u32, read: *const c_void, out: *mut *mut u8) -> HRESULT {
     #[cfg(windows)]
-    if crate::host::feedback::enabled() || crate::host::frame_end::why() {
+    if crate::host::feedback::enabled() || crate::host::frame_end::why() || crate::host::back_age::enabled() {
         let r = resource(this);
         if r.desc.dimension == BUFFER {
             let size = r.desc.width as usize;
@@ -2869,6 +2869,7 @@ extern "system" fn map(this: This, _sub: u32, read: *const c_void, out: *mut *mu
                 let range = (base.saturating_add(from), base.saturating_add(to.min(size)));
                 if crate::host::frame_end::why() { crate::host::frame_end::map_intent(range.0, range.1); }
                 crate::host::feedback::before_map(range.0, range.1);
+                crate::host::back_age::map_ready(range);
             }
         }
     }

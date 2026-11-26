@@ -726,7 +726,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         // Diagnostic: which present the submission comes before.
-        if crate::texback::enabled() || crate::host::feedback::enabled() {
+        if crate::texback::enabled() || crate::host::feedback::enabled() || crate::host::back_age::enabled() {
             for &l in lists {
                 crate::list::mark_submitted(l);
             }
@@ -970,6 +970,8 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    crate::host::back_age::begin_present();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     #[cfg(windows)]
@@ -1124,6 +1126,11 @@ extern "system" fn present(
     crate::host::settle_backs(upto);
     #[cfg(windows)]
     if let Some(b) = boundary { b.report(barrier_end, full_wait); }
+    #[cfg(windows)]
+    if crate::host::back_age::enabled() {
+        crate::host::back_age::end_present(&PRESENTS_DONE);
+        return S_OK;
+    }
     PRESENTS_DONE.fetch_add(1, Ordering::Release);
     S_OK
 }

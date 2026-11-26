@@ -274,15 +274,15 @@ struct Views {
     /// (`crate::watch` guards them all).
     pages: BTreeMap<(usize, u64), Vec<usize>>,
     /// Sections by handle: bytes, and whether made committed.
-    sections: Vec<(usize, u64, bool)>,
+    sections: BTreeMap<usize, (u64, bool)>,
     /// Sections by handle: where a writable view of our own of the whole
     /// section lies ([`own_view`], `VICTORY_WRITE_ASIDE=1`); mapped when
     /// first asked for, unmapped when the runtime closes the section.
-    own: Vec<(usize, usize)>,
+    own: BTreeMap<usize, usize>,
 }
 
 static VIEWS: Mutex<Views> =
-    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: Vec::new(), own: Vec::new() });
+    Mutex::new(Views { views: BTreeMap::new(), pages: BTreeMap::new(), sections: BTreeMap::new(), own: BTreeMap::new() });
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -292,8 +292,7 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views();
-    v.sections.retain(|s| s.0 != section);
-    v.sections.push((section, bytes, committed));
+    v.sections.insert(section, (bytes, committed));
     // A handle told anew is another section: our view of the old one goes.
     forget_own(&mut v, section);
 }
@@ -305,20 +304,17 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 /// the bytes' mapping while it writes).
 pub fn title_memory_section_closed(section: usize) {
     let mut v = views();
-    v.sections.retain(|s| s.0 != section);
+    v.sections.remove(&section);
     forget_own(&mut v, section);
 }
 
 /// Our own view of `section` is unmapped and forgotten.
 fn forget_own(v: &mut Views, section: usize) {
     use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
-    v.own.retain(|&(handle, base)| {
-        if handle == section {
-            // SAFETY: a view we mapped ([`own_view`]) and nobody else holds.
-            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ }) };
-        }
-        handle != section
-    });
+    if let Some(base) = v.own.remove(&section) {
+        // SAFETY: a view we mapped ([`own_view`]) and nobody else holds.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base as *mut _ }) };
+    }
 }
 
 /// The bytes the title sees at `[at, at + len)`, in a writable view of our
@@ -336,8 +332,8 @@ pub(crate) fn own_view(at: usize, len: usize) -> Option<*mut u8> {
     if within >= bytes || len > bytes - within {
         return None;
     }
-    let own = match v.own.iter().find(|o| o.0 == section) {
-        Some(o) => o.1,
+    let own = match v.own.get(&section) {
+        Some(&base) => base,
         None => {
             // SAFETY: the runtime's section, alive while a view of it is
             // shown; the whole of it, address space only (its pages are the
@@ -346,7 +342,7 @@ pub(crate) fn own_view(at: usize, len: usize) -> Option<*mut u8> {
             if mapped == 0 {
                 return None;
             }
-            v.own.push((section, mapped));
+            v.own.insert(section, mapped);
             mapped
         }
     };
@@ -1106,9 +1102,13 @@ fn census_of(spans: &[(u64, u64, bool)]) -> Vec<String> {
         bytes >> 20,
         big >> 20
     ));
-    for &(_, bytes, committed) in &v.sections {
+    let mut groups = BTreeMap::new();
+    for &section in v.sections.values() {
+        *groups.entry(section).or_insert(0usize) += 1;
+    }
+    for ((bytes, committed), count) in groups {
         lines.push(format!(
-            "census, a section of {} MB, {}",
+            "census, {count} sections of {} MB each, {}",
             bytes >> 20,
             if committed { "committed: it can be opened as one heap" } else { "reserved: refused as a heap until it is made with SEC_COMMIT" }
         ));
@@ -1234,8 +1234,8 @@ mod tests {
         let mut v = super::Views {
             views: [(page, (page, 42, 0))].into(),
             pages: Default::default(),
-            sections: Vec::new(),
-            own: Vec::new(),
+            sections: BTreeMap::new(),
+            own: BTreeMap::new(),
         };
         let max = crate::watch::MANY_VIEWS;
         for count in [0, 1, 2, max, max + 1] {

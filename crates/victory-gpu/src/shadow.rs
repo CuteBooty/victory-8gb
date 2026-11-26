@@ -1424,11 +1424,27 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
 /// ranges compared in windows and in buffers' copies.
 static BACK_CLASS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+fn quiet_back() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_QUIET").is_some_and(|v| v == "1"))
+}
+
+// Bytes and stretches for which this shadow kept its copy, and fallbacks.
+static QUIET: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
 /// For the frame-rate line: where the CPU's search for shader writes goes
 /// (per frame). A copy of a title buffer can go to the card's memory,
 /// where the card does the search (`VICTORY_CARD_BUFFERS_MIN_MB`); a
 /// window outside buffers cannot as the code stands.
 pub(crate) fn back_line(frames: f64) {
+    if quiet_back() {
+        tracing::info!(
+            quiet_mib = QUIET[0].load(Ordering::Relaxed) as f64 / (1 << 20) as f64,
+            quiet_stretches = QUIET[1].load(Ordering::Relaxed),
+            fallback_stretches = QUIET[2].load(Ordering::Relaxed),
+            "shadow copy-backs since start (VICTORY_BACK_QUIET)"
+        );
+    }
     let c: Vec<f64> = BACK_CLASS.iter().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if c.iter().all(|&v| v == 0.0) {
         return;
@@ -2204,11 +2220,11 @@ impl Shadow {
                     *h = merged;
                 }
                 if differs != 0 {
-                    crate::host::write_title(start + at, title.as_ptr(), n);
+                    self.write_merged(start + at, title, None);
                     written += n;
                 }
             }
-            // Our write shows as a title write at the copy's next refresh,
+            // Ordinarily our write shows as a title write at the next refresh,
             // which copies those pages once more (some dozens of MB a
             // frame). Asking about the whole range here, to note them
             // current, cost more: 19-31 askings a frame over 110-174 MB of
@@ -2217,6 +2233,32 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
         written
+    }
+
+    /// The waited merge already updated its side. A relay passes its actual
+    /// bytes so a title change missing from the side still gets a refresh.
+    fn write_merged(&self, at: usize, bytes: &[u8], side: Option<&[u8]>) {
+        if quiet_back() {
+            if side.is_none_or(|side| side == bytes)
+                && let Some(mapping) = crate::watch::title_memory_reading_now(at / PAGE * PAGE, PAGE)
+                // The settle thread may already hold the snapshot lock.
+                && let Ok(mut stamps) = self.copied.try_lock()
+                && let Some(stamp) = stamps.get_mut(at / PAGE - self.start as usize / PAGE)
+            {
+                let before = *stamp;
+                if crate::watch::quiet_copy_back(&mapping, at, bytes, stamp) {
+                    if *stamp != before {
+                        QUIET[0].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        QUIET[1].fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        QUIET[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
+            }
+            QUIET[2].fetch_add(1, Ordering::Relaxed);
+        }
+        crate::host::write_title(at, bytes.as_ptr(), bytes.len());
     }
 
     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
@@ -2292,7 +2334,7 @@ impl Shadow {
         if !merge_piece(now, held, title) {
             return 0;
         }
-        crate::host::write_title(start + at, title.as_ptr(), n);
+        self.write_merged(start + at, title, Some(now));
         n
     }
 
@@ -3019,7 +3061,7 @@ impl Shadow {
                 *o = merged;
             }
             if differs != 0 {
-                crate::host::write_title(start + at, title.as_ptr(), n);
+                self.write_merged(start + at, title, None);
                 written = n;
             }
         } else {
@@ -3084,6 +3126,7 @@ impl Shadow {
         title.resize(n, 0);
         let mapped = crate::host::read_into((start + at) as *const u8, title);
         let mut changed = false;
+        let skipped = !skip.is_empty();
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
@@ -3093,7 +3136,16 @@ impl Shadow {
         if !mapped || !changed {
             return 0;
         }
-        crate::host::write_title(start + at, title.as_ptr(), n);
+        if skipped {
+            // The relay excluded pending/later sends. Their side still
+            // needs ordinary write notification over the merged stretch.
+            if quiet_back() {
+                QUIET[2].fetch_add(1, Ordering::Relaxed);
+            }
+            crate::host::write_title(start + at, title.as_ptr(), n);
+        } else {
+            self.write_merged(start + at, title, Some(held));
+        }
         n
     }
 }
