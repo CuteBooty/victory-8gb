@@ -84,6 +84,9 @@ impl HostPolicy {
             && let Some(observer) = victory_gpu::wait_timing::observer(dll, name) {
             return Some(observer);
         }
+        // Disjoint from the wait observers above (memory and file calls only).
+        #[cfg(windows)]
+        let address = crate::modules::watch_io::host_export(address);
         Some(address)
     }
 }

@@ -19,6 +19,8 @@ pub mod dsp;
 pub mod dstorage;
 #[cfg(windows)]
 pub mod files;
+#[cfg(windows)]
+pub(crate) mod watch_io;
 pub mod gameinput;
 pub mod kernel;
 #[cfg(windows)]

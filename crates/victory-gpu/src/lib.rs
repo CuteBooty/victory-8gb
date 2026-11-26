@@ -39,6 +39,8 @@ mod query_why;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod heap_pass;
 #[cfg(windows)]
+mod heap_worker;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod over;
@@ -82,7 +84,9 @@ pub use census::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_closed, title_memory_view};
 #[cfg(windows)]
+pub use watch::light::{on as light_refresh_enabled, quarantine_opaque_io, SynchronousWrite, WriteWindow, synchronous_write_window, kernel_write_window, mapping_window, physical_write_window, protection_window};
+#[cfg(windows)]
 pub use watch::{
-    title_memory_by_range, title_memory_reading, title_memory_remapped, title_memory_remapping,
+    title_memory_by_range, title_memory_mapped, title_memory_reading, title_memory_remapped, title_memory_remapping,
     writing as kernel_will_write,
 };

@@ -57,6 +57,19 @@ struct Upscale {
     upscale: [u32; 2],
 }
 
+// Continuation of ffxDispatchDescUpscale. Read the tail only for temporal
+// stretching. Use the low byte of the API boolean on this little-endian ABI.
+#[cfg(any(windows, test))]
+#[repr(C)]
+struct TemporalUpscale {
+    base: Upscale,
+    enable_sharpening: u8,
+    sharpness: f32,
+    frame_time_delta: f32,
+    pre_exposure: f32,
+    reset: u8,
+}
+
 const _: () = assert!(size_of::<Resource>() == 48);
 const _: () = assert!(std::mem::offset_of!(Upscale, output) == 0x138);
 
@@ -90,13 +103,30 @@ extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u
                 );
             }
             #[cfg(windows)]
-            if victory_gpu::list::upscale_stretch(
-                d.list,
-                d.colour.resource,
-                d.output.resource,
-                d.render,
-            ) {
-                return 0;
+            {
+                let frame = victory_gpu::list::upscale_history_enabled().then(|| {
+                    // SAFETY: this is the public upscale dispatch, selected by its header.
+                    let t = unsafe { &*desc.cast::<TemporalUpscale>() };
+                    victory_gpu::list::UpscaleFrame {
+                        // ffxContext is an opaque handle passed by address.
+                        context: unsafe { context.as_ref() }.copied().unwrap_or_default() as usize,
+                        upscale_size: d.upscale,
+                        jitter: d.jitter,
+                        reset: t.reset != 0,
+                        pre_exposure: t.pre_exposure,
+                        depth: d.depth.resource as usize,
+                        motion: d.motion.resource as usize,
+                        reactive: d.reactive.resource as usize,
+                        motion_scale: d.motion_scale,
+                        flags: unsafe { context.as_ref() }
+                            .and_then(|c| context_flags(*c as usize)),
+                    }
+                });
+                if victory_gpu::list::upscale_stretch_with_history(
+                    d.list, d.colour.resource, d.output.resource, d.render, frame,
+                ) {
+                    return 0;
+                }
             }
             if first {
                 tracing::warn!("upscale dispatch not stretched: left to the title's upscaler");
@@ -132,6 +162,94 @@ pub fn dispatch_address() -> usize {
     dispatch as *const () as usize
 }
 
+// ---------------------------------------------------------------------------
+// Context creation, watched for the upscale context's flags
+// ---------------------------------------------------------------------------
+//
+// `VICTORY_UPSCALE_HISTORY_MV=2` reprojects history with the dispatch's
+// motion vectors. Whether those include jitter, whether depth is inverted and
+// whether the vectors are at display resolution are flags of the upscale
+// context (`ffxCreateContextDescUpscale.flags`, public `ffx_upscale.h`), given
+// once at `ffxCreateContext`. That call is passed to the title's own and its
+// flags are noted against the context it made. Bound only with level two on.
+
+static REAL_CREATE: AtomicUsize = AtomicUsize::new(0);
+
+/// `FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE`.
+const CREATE_UPSCALE: u64 = 0x0001_0000;
+
+/// `ffxCreateContextDescUpscale`: the header, then the flags.
+#[allow(dead_code)] // the sizes are the API's, kept for the layout
+#[repr(C)]
+struct CreateUpscale {
+    header: Header,
+    flags: u32,
+    max_render: [u32; 2],
+    max_upscale: [u32; 2],
+}
+
+type Create = extern "system" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
+
+/// Upscale contexts made and their flags (few: one or two per run).
+static FLAGS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The title's own `ffxCreateContext`.
+pub fn set_real_create(address: usize) {
+    REAL_CREATE.store(address, Ordering::Relaxed);
+}
+
+/// What the title's import of `ffxCreateContext` is bound to: ours when the
+/// title's own was found and level two is on, else the title's own.
+pub fn create_address() -> Option<usize> {
+    let wanted = std::env::var("VICTORY_UPSCALE_HISTORY_MV").is_ok_and(|v| v.trim() == "2");
+    (wanted && REAL_CREATE.load(Ordering::Relaxed) != 0).then_some(create as *const () as usize)
+}
+
+/// The creation flags of upscale context `context`, if its creation was seen.
+pub fn context_flags(context: usize) -> Option<u32> {
+    let flags = FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+    flags.iter().rev().find(|(c, _)| *c == context).map(|&(_, f)| f)
+}
+
+/// The upscale flags in a creation description chain, if it has an upscale
+/// description (at most 16 links are followed).
+fn upscale_flags(desc: *const Header) -> Option<u32> {
+    let mut at = desc;
+    for _ in 0..16 {
+        // SAFETY: the title's description chain, each link a header.
+        let header = unsafe { at.as_ref() }?;
+        if header.kind == CREATE_UPSCALE {
+            // SAFETY: an upscale creation description, by its type.
+            return Some(unsafe { &*at.cast::<CreateUpscale>() }.flags);
+        }
+        at = header.next;
+    }
+    None
+}
+
+extern "system" fn create(context: *mut *mut c_void, desc: *mut Header, memory: *const c_void) -> u32 {
+    let real = REAL_CREATE.load(Ordering::Relaxed);
+    if real == 0 {
+        return ERROR;
+    }
+    // SAFETY: the title's own `ffxCreateContext`, with its own arguments.
+    let code = unsafe { std::mem::transmute::<usize, Create>(real)(context, desc, memory) };
+    if code == 0
+        && let Some(flags) = upscale_flags(desc)
+    {
+        // SAFETY: the context the call just wrote.
+        let made = unsafe { context.as_ref() }.map_or(0, |c| *c as usize);
+        tracing::info!(context = ?made, flags = format_args!("{flags:#x}"), "upscale context made");
+        let mut all = FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|(c, _)| *c != made);
+        if all.len() >= 16 {
+            all.remove(0);
+        }
+        all.push((made, flags));
+    }
+    code
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,8 +269,33 @@ mod tests {
         assert_eq!(offset_of!(Upscale, motion_scale), 0x170);
         assert_eq!(offset_of!(Upscale, render), 0x178);
         assert_eq!(offset_of!(Upscale, upscale), 0x180);
+        assert_eq!(offset_of!(TemporalUpscale, pre_exposure), 0x194);
+        assert_eq!(offset_of!(TemporalUpscale, reset), 0x198);
         assert_eq!(offset_of!(Resource, description), 8);
         assert_eq!(offset_of!(Resource, state), 40);
+    }
+
+    /// The upscale creation description's flags sit after the header, and
+    /// the chain is walked to the upscale link.
+    #[test]
+    fn the_upscale_flags_are_found_in_the_creation_chain() {
+        assert_eq!(offset_of!(CreateUpscale, flags), 0x10);
+        assert_eq!(offset_of!(CreateUpscale, max_render), 0x14);
+        let upscale = CreateUpscale {
+            header: Header { kind: CREATE_UPSCALE, next: std::ptr::null() },
+            flags: 0b1100,
+            max_render: [1280, 720],
+            max_upscale: [1920, 1080],
+        };
+        let backend = Header {
+            kind: 0x0000_0002,
+            next: (&upscale as *const CreateUpscale).cast(),
+        };
+        assert_eq!(upscale_flags(&backend), Some(0b1100));
+        let alone = Header { kind: 0x0000_0002, next: std::ptr::null() };
+        assert_eq!(upscale_flags(&alone), None);
+        assert_eq!(upscale_flags(std::ptr::null()), None);
+        assert_eq!(context_flags(0x1234_5678), None);
     }
 
     /// A dispatch that is not an upscale, with no DLL of the title's to

@@ -34,7 +34,7 @@ pub(crate) struct Shadow {
     len: u64,
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
-    copied: Mutex<Vec<u64>>,
+    copied: Mutex<Copied>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -77,6 +77,46 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+}
+
+#[derive(Default)]
+struct Copied {
+    pages: Vec<u64>,
+    // The last and largest fully refreshed byte ranges include partial end pages.
+    ranges: [(usize, usize, u64); 2],
+    // After a GPU writer, a journal stamp alone cannot vouch for the host bytes.
+    // Allocate only for shadows with such writes; a full source read restores trust.
+    gpu: Vec<bool>,
+}
+
+impl Copied {
+    fn ranged(&self, from: usize, to: usize) -> u64 {
+        self.ranges.iter().filter(|&&(a, e, _)| a <= from && to <= e).map(|r| r.2).max().unwrap_or(0)
+    }
+
+    fn remember(&mut self, from: usize, to: usize, stamp: u64) {
+        let range = (from, to, stamp);
+        self.ranges[0] = range;
+        if to - from >= self.ranges[1].1 - self.ranges[1].0 {
+            self.ranges[1] = range;
+        }
+    }
+}
+
+#[cfg(test)]
+mod light_range_tests {
+    use super::Copied;
+
+    #[test]
+    fn a_partial_copy_vouches_only_for_bytes_inside_it() {
+        let mut copied = Copied::default();
+        copied.remember(3, 19, 7);
+        copied.remember(10, 14, 11);
+        assert_eq!(copied.ranged(3, 19), 7);
+        assert_eq!(copied.ranged(11, 13), 11);
+        assert_eq!(copied.ranged(2, 19), 0);
+        assert_eq!(copied.ranged(18, 20), 0);
+    }
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1786,7 +1826,7 @@ pub(crate) fn window_use() -> [u64; 8] {
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
+        let pages = copied.pages.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
         if crate::host::references(&s.buffer) > 1 {
             out[1] += 1;
@@ -1971,7 +2011,7 @@ impl Shadow {
             gpu,
             start,
             len,
-            copied: Mutex::new(vec![0; pages as usize]),
+            copied: Mutex::new(Copied { pages: vec![0; pages as usize], ..Default::default() }),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -2041,6 +2081,15 @@ impl Shadow {
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {
             return;
+        }
+        if crate::watch::light::on() {
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let pages = copied.pages.len();
+            copied.gpu.resize(pages, false);
+            let (from, to) = self.inside(address, len);
+            if from < to {
+                copied.gpu[self.pieces(from, to)].fill(true);
+            }
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
@@ -2243,7 +2292,7 @@ impl Shadow {
                 && let Some(mapping) = crate::watch::title_memory_reading_now(at / PAGE * PAGE, PAGE)
                 // The settle thread may already hold the snapshot lock.
                 && let Ok(mut stamps) = self.copied.try_lock()
-                && let Some(stamp) = stamps.get_mut(at / PAGE - self.start as usize / PAGE)
+                && let Some(stamp) = stamps.pages.get_mut(at / PAGE - self.start as usize / PAGE)
             {
                 let before = *stamp;
                 if crate::watch::quiet_copy_back(&mapping, at, bytes, stamp) {
@@ -2504,7 +2553,7 @@ impl Shadow {
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
             Some((_, written)) => written.into_iter().any(|(page, write)| {
-                page >= base && copied.get(page - base).is_none_or(|&at| at == 0 || write > at)
+                page >= base && copied.pages.get(page - base).is_none_or(|&at| at == 0 || write > at)
             }),
             None => true,
         })
@@ -2562,7 +2611,7 @@ impl Shadow {
                 let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
                 written
                     .into_iter()
-                    .filter(|&(page, write)| page >= base && copied.get(page - base).is_none_or(|&at| at == 0 || write > at))
+                    .filter(|&(page, write)| page >= base && copied.pages.get(page - base).is_none_or(|&at| at == 0 || write > at))
                     .map(|(page, _)| page)
                     .collect()
             };
@@ -2628,7 +2677,7 @@ impl Shadow {
                 // only whole pages, and the page is looked at again.
                 if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(at) = copied.get_mut(page - base) {
+                    if let Some(at) = copied.pages.get_mut(page - base) {
                         *at = now;
                     }
                 }
@@ -2637,11 +2686,103 @@ impl Shadow {
         false
     }
 
+    /// Can the refresh use its existing host bytes? Only a published journal
+    /// write for *every* block can vouch for a whole or partial-page copy.
+    pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+        use crate::watch::light;
+        if !light::on() { return false; }
+        if self.place.is_some() { return true; }
+        #[cfg(feature = "diagnostics")]
+        if crate::copystat::mode() == 2 { return false; } // timing run: the copy has no source bytes
+        let start = self.start as usize;
+        let (from, to) = (address.max(start), address.saturating_add(len).min(start + self.len as usize));
+        if from >= to { return true; }
+        if self.watched.load(Ordering::Relaxed) != 1 { return false; }
+        let candidate = light::candidate(from, to);
+        #[cfg(feature = "diagnostics")]
+        let candidate = candidate || light::trial_candidate(from, to);
+        if !candidate { return false; }
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.iter().any(|&(a, e)| a < to && from < e) {
+            light::PENDING_HELD.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let base = start / PAGE;
+        if !copied.gpu.is_empty() && copied.gpu[from / PAGE - base..to.div_ceil(PAGE) - base].contains(&true) {
+            light::SHADOW_HELD.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        let current = || light::current(from, to, base, &copied.pages, copied.ranged(from, to));
+        if !current() {
+            #[cfg(feature = "diagnostics")]
+            if light::trial_candidate(from, to) {
+                let prediction = || light::current_states(from, to, base, &copied.pages, copied.ranged(from, to), 3);
+                if prediction() && light::sample_due() {
+                    self.check_light(from, to, prediction);
+                }
+            }
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            if light::sample_due() && !self.check_light(from, to, current) { return false; }
+            use crate::copystat::{C, add};
+            add(C::Checked, (to - from) as u64);
+            add(C::Unchanged, (to - from) as u64);
+            add(C::EpochSkips, 1);
+        }
+        self.refresh_check(from, to);
+        light::SKIPPED.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn check_light(&self, from: usize, to: usize, current: impl Fn() -> bool) -> bool {
+        use crate::watch::light;
+        // The caller holds pending and copied: neither a new shader writer
+        // nor a host refresh can start changing the shadow during this scan.
+        light::with_check_buffer(|buf| {
+            let mut at = from;
+            let mut difference = None;
+            while at < to {
+                let len = buf.len().min(to - at);
+                if !crate::host::read_into(at as *const _, &mut buf[..len]) {
+                    light::INCONCLUSIVE.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                // SAFETY: from..to was clipped to this shadow's mapped allocation.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(at - self.start as usize), len) };
+                if let Some(i) = first_difference(host, &buf[..len]) {
+                    difference = Some(at + i);
+                    break;
+                }
+                at += len;
+            }
+            // A real write/remap during the scan invalidates this comparison.
+            if !current() {
+                light::INCONCLUSIVE.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            light::SAMPLES.fetch_add(1, Ordering::Relaxed);
+            if let Some(at) = difference {
+                light::mismatch(at, "shadow bytes");
+                return false;
+            }
+            true
+        })
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied and adds the bytes selected
     /// for source reads (including reads made solely for comparison).
     pub(crate) fn update(&self, address: usize, len: usize, source_bytes: &mut usize) -> usize {
+        if self.nothing_new(address, len) { return 0; }
+        self.update_after_filter(address, len, source_bytes)
+    }
+
+    pub(crate) fn update_after_filter(&self, address: usize, len: usize, source_bytes: &mut usize) -> usize {
         // In place: the card reads title memory itself.
         if self.place.is_some() {
             return 0;
@@ -2807,7 +2948,7 @@ impl Shadow {
                 }
                 _ => 0,
             };
-            let at = &mut copied[page - base];
+            let at = &mut copied.pages[page - base];
             if *at == 0 || write > *at {
                 #[cfg(feature = "diagnostics")]
                 {
@@ -2828,6 +2969,7 @@ impl Shadow {
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
+                    if let Some(written) = copied.gpu.get_mut(page - base) { *written = false; }
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
@@ -2854,6 +2996,9 @@ impl Shadow {
             for (a, e) in runs {
                 self.copy(a, e);
             }
+        }
+        if crate::watch::light::on() {
+            copied.remember(from, to, now);
         }
         bytes
     }

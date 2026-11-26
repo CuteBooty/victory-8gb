@@ -137,6 +137,9 @@ pub extern "system" fn XMemVirtualAlloc(
             kind |= MEM_WRITE_WATCH;
         }
     }
+    let changing_protection = if !base.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::protection_window(base as usize, size)
+    } else { None };
     // SAFETY: the title's own arguments, cleaned of console bits; the
     // parameter points at `requirements`, which outlives the call.
     let at = unsafe {
@@ -154,6 +157,12 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if let Some(window) = changing_protection {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        let error = unsafe { GetLastError() };
+        if at.is_null() { drop(window); } else { window.quarantine(); }
+        unsafe { SetLastError(error) };
+    }
     if base.is_null() {
         // The census keeps what the title asked for (`VICTORY_CENSUS`,
         // `VICTORY_SKIP_WC_BACK`; nothing is kept with both off). Fork PR 868.
@@ -507,6 +516,7 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 /// A view of our own on consecutive slices of one section, committed and
 /// writable, unmapped when dropped.
 struct View {
+    _writing: Option<victory_gpu::WriteWindow>,
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
 }
@@ -516,6 +526,7 @@ impl View {
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
+        let writing = victory_gpu::physical_write_window(slice.section.0 as usize, offset, len);
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
@@ -529,7 +540,7 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        let view = View { at, len, _writing: writing };
         commit(at.Value as usize, len).then_some(view)
     }
 
@@ -956,6 +967,7 @@ fn alias(physical: &mut Physical, to: u64, from: u64, len: u64) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    let _mapping = victory_gpu::mapping_window(base, slice.section.0 as usize, (slice.index * PAGE) as u64, len);
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -992,9 +1004,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
-    // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_mapped(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
     physical.note_shown(base, len, &slice, true);
     physical.views.insert(base, (len, slice));
     true
@@ -1097,6 +1107,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        let _mapping = victory_gpu::mapping_window(at, slice.section.0 as usize, (slice.index * PAGE) as u64, size);
         physical.note_shown(at, size, &slice, false);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {

@@ -16,6 +16,8 @@ pub(crate) enum Role {
     Submit,
     Relay,
     Helper,
+    /// The heap worker (`VICTORY_HEAP_WORKER`): a lane of its own.
+    Heap,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,6 +91,9 @@ const SUBMIT_PHASES: &[Phase] = &[
 const RELAY_PHASES: &[Phase] = &[
     Gpu, Idle, Land, CardMerge, Merge, Publish, Writes, Memory, Mapping, Other,
 ];
+// The heap worker (merged in lab-v8a-s): its pass ("prepare"), waiting for
+// one ("idle"), the watch's locks.
+const HEAP_PHASES: &[Phase] = &[Prepare, Idle, Memory, Mapping, Other];
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -290,7 +295,7 @@ struct Window {
     wall: u64,
     worst: u64,
     worst_lanes: [[u64; N]; 3],
-    lanes: [Summary; 4],
+    lanes: [Summary; 5],
     overlaps: [u64; 6],
     overlap_peak: [u64; 6],
     ack: [u64; 2],
@@ -314,7 +319,8 @@ pub(crate) fn frame() {
     let current = TRACK.with(Arc::clone);
     let mut w = lock(&WINDOW);
     let mut tracks = lock(&TRACKS);
-    let mut lanes = [[0; N]; 4]; // presenter, submit, relay, other callers
+    let mut lanes = [[0; N]; 5]; // presenter, submit, relay, other callers, heap worker
+    let mut heap_seen = false;
     let mut guards: Vec<_> = tracks.iter().map(|t| lock(t)).collect();
     let now = Instant::now();
     for (track, t) in tracks.iter().zip(&mut guards) {
@@ -324,6 +330,10 @@ pub(crate) fn frame() {
             Role::Submit => 1,
             Role::Relay => 2,
             Role::Caller => 3,
+            Role::Heap => {
+                heap_seen = true;
+                4
+            }
             Role::Unknown | Role::Helper => continue,
         };
         for (out, v) in lanes[lane].iter_mut().zip(ns) {
@@ -349,6 +359,9 @@ pub(crate) fn frame() {
         .zip([CALLER_PHASES, SUBMIT_PHASES, RELAY_PHASES])
     {
         complete(ns, wall, phases);
+    }
+    if heap_seen {
+        complete(&mut lanes[4], wall, HEAP_PHASES);
     }
     if wall >= w.worst {
         w.worst = wall;
@@ -444,6 +457,12 @@ pub(crate) fn frame() {
         window.flight_peak as f64 / 1e6,
         window.flights as f64 / frames
     );
+    if window.lanes[4].sum.iter().any(|&v| v != 0) {
+        tracing::info!(
+            "why2 heap worker ms avg/max {}",
+            window.lanes[4].fields(frames, HEAP_PHASES)
+        );
+    }
 }
 
 static ACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];

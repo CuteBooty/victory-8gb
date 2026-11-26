@@ -199,6 +199,12 @@ pub(crate) struct Detached {
 
 #[cfg(windows)]
 impl Detached {
+    /// A closed list of ours, to run among a title's (`crate::heap_worker`;
+    /// fxceless, victory-fork d4a528ba).
+    pub(crate) fn ours(host: crate::host::HostList) -> Self {
+        Detached { host, _uploads: Vec::new(), _state: Default::default() }
+    }
+
     pub(crate) fn retire_tables(&mut self, fence: u64, completed: Option<u64>) {
         self._state.retire_tables(fence, completed);
     }
@@ -262,7 +268,7 @@ fn pools() -> bool {
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
@@ -839,14 +845,57 @@ pub fn upscale_stretch(
     output: *const std::ffi::c_void,
     render: [u32; 2],
 ) -> bool {
+    upscale_stretch_with_history(this, colour, output, render, None)
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub struct UpscaleFrame {
+    pub context: usize,
+    pub upscale_size: [u32; 2],
+    pub jitter: [f32; 2],
+    pub reset: bool,
+    pub pre_exposure: f32,
+    /// The dispatch's depth, motion vector and reactive mask textures (title
+    /// resources, 0 when absent), read by `VICTORY_UPSCALE_HISTORY_MV=2`.
+    pub depth: usize,
+    pub motion: usize,
+    pub reactive: usize,
+    /// `motionVectorScale` of the dispatch.
+    pub motion_scale: [f32; 2],
+    /// The upscale context's creation flags, when its creation was seen.
+    pub flags: Option<u32>,
+}
+
+#[cfg(windows)]
+pub fn upscale_history_enabled() -> bool {
+    crate::over::history::settings().is_some()
+}
+
+/// Whether the upscale history wants the context's creation flags and the
+/// dispatch's depth, motion and reactive inputs (`VICTORY_UPSCALE_HISTORY_MV=2`).
+#[cfg(windows)]
+pub fn upscale_history_wants_inputs() -> bool {
+    crate::over::history::wants_inputs()
+}
+
+#[cfg(windows)]
+pub fn upscale_stretch_with_history(
+    this: *const std::ffi::c_void,
+    colour: *const std::ffi::c_void,
+    output: *const std::ffi::c_void,
+    render: [u32; 2],
+    frame: Option<UpscaleFrame>,
+) -> bool {
     const SHADER_READ: u32 = 0x40;
     const UNORDERED: u32 = 0x8;
     let (this, colour, output): (This, This, This) = (this.cast(), colour.cast(), output.cast());
-    if this.is_null() || colour.is_null() || output.is_null() {
-        return false;
-    }
     let mut done = false;
+    let mut pending = frame;
     with_state(this, |list, state| {
+        if colour.is_null() || output.is_null() {
+            return;
+        }
         let (Some(to), Some(from), Some(host)) = (
             crate::resource::host_resource(output),
             crate::resource::host_resource(colour),
@@ -856,12 +905,35 @@ pub fn upscale_stretch(
         };
         ensure_state(list, colour, SHADER_READ);
         ensure_state(list, output, UNORDERED);
-        done = crate::over::record_stretch(&host.device, &list.list, to, from, render);
+        let temporal_done = pending.take().is_some_and(|frame| {
+            let mut inputs = crate::over::history::Inputs::default();
+            if crate::over::history::wants_inputs() {
+                let input = |p: usize| {
+                    let this: This = (p as *const std::ffi::c_void).cast();
+                    let made = crate::resource::host_resource(this).and_then(|resource| {
+                        crate::over::history::Input::new(resource, crate::resource::view_format(this))
+                    });
+                    if made.is_some() {
+                        ensure_state(list, this, SHADER_READ);
+                    }
+                    made
+                };
+                inputs.depth = input(frame.depth);
+                inputs.motion = input(frame.motion);
+                inputs.reactive = input(frame.reactive);
+            }
+            crate::over::history::record(&host.device, list, to, from, render, frame, inputs)
+        });
+        done = temporal_done
+            || crate::over::record_stretch(&host.device, &list.list, to, from, render);
         if done {
             crate::texture::host_written(output);
         }
         state.replay(list);
     });
+    if let Some(frame) = pending {
+        crate::over::history::failed(frame);
+    }
     done
 }
 

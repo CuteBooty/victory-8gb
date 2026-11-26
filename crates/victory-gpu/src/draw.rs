@@ -235,13 +235,22 @@ fn bake_loading() -> Option<(u64, u64)> {
 /// slots looked at, textures uploaded and their bytes, slots refused, and
 /// whether the card had room.
 #[derive(Clone, Copy, Default)]
-struct TexturePass {
+pub(crate) struct TexturePass {
     due: u64,
     looked: u64,
     uploaded: u64,
     bytes: u64,
     refused: u64,
     room: bool,
+}
+
+/// Where the pass over textures picked by index ([`State::heap_textures`])
+/// records its uploads: into a list of the title's, or into lists of the
+/// thread that runs it ahead (`crate::heap_worker`, `VICTORY_HEAP_WORKER=1`;
+/// fxceless, victory-fork d4a528ba, PR 1007, where it is named `Into`).
+pub(crate) enum TexturesInto<'a> {
+    List(&'a HostList),
+    Ahead(&'a mut crate::heap_worker::Batch),
 }
 
 /// Whether a buffer range a shader names through an unordered access view
@@ -676,6 +685,28 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+
+type HeapPicked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
+/// Per host heap, by its address: what [`State::heap_buffers`] keeps from
+/// pass to pass (the host copies its buffer views read, and with
+/// `VICTORY_DESC_DIRTY` the heap's dirty-page state, both in the entry).
+static HEAP_RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, HeapPicked>>> =
+    std::sync::Mutex::new(None);
+
+/// The host heap at `heap` goes: its entry goes with it, before another heap
+/// can be made at that address (which would inherit a stale cache), and the
+/// host copies it kept are let go. Port of UwUCammie's victory-fork PR 1276
+/// (0e21fcfb), which also clears a second cache our tree does not have.
+pub(crate) fn forget_heap_ranges(heap: &crate::descriptor::host::HostHeap) {
+    let key = std::ptr::from_ref(heap) as usize;
+    let gone = HEAP_RANGES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|heaps| heaps.remove(&key));
+    // Dropping a host copy can release GPU resources: outside the lock.
+    drop(gone);
+}
 /// Of those microseconds: looking at slots, the copies' spans and their
 /// refreshes, the texture side ([`State::heap_textures`]).
 pub(crate) static HEAP_PASS_MICROS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -1899,10 +1930,8 @@ impl State {
         // view's resource released, their record copied past the API, no
         // host copy yet); 83,000 slots a pass otherwise, 0.1 s at best.
         // `VICTORY_HEAP_PASS_FULL=1`: all of them every 16 passes, as before.
-        type Picked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, Picked>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        // (`HEAP_RANGES`, at module level: a heap's entry goes with it.)
+        let mut kept = HEAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let heaps = kept.get_or_insert_with(Default::default);
         // One list of freed table entries for all heaps: each heap's pass is told.
         let forgotten = crate::descriptor::take_forgotten();
@@ -1911,7 +1940,28 @@ impl State {
         }
         let ranges = heaps
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| Picked::new(crate::heap_pass::full_pass()));
+            .or_insert_with(|| HeapPicked::new(crate::heap_pass::full_pass()));
+        // `VICTORY_DESC_DIRTY`: the journal is asked about the heap's memory
+        // before any record is read (a write after the asking is in the
+        // next), and the plan compares only records on pages written since.
+        // Not with title memory in place: the card writes it unseen.
+        if crate::heap_pass::desc_dirty().is_some() {
+            if crate::inplace::level() != 0 {
+                crate::heap_pass::dirty_no_look(crate::heap_pass::NoLook::InPlace);
+            } else if heap.span().is_none() {
+                crate::heap_pass::dirty_no_look(crate::heap_pass::NoLook::NoSpan);
+            }
+        }
+        if let Some(mode) = crate::heap_pass::desc_dirty()
+            && crate::inplace::level() == 0
+            && let Some((start, end, step)) = heap.span()
+        {
+            let epoch = crate::watch::remap_epoch();
+            let answer = crate::watch::writes_now(start as usize, end as usize, mode >= 2);
+            ranges.observe(std::ptr::from_ref(heap) as usize, start, end, step, answer, epoch, |since| {
+                crate::watch::remapped_since(start as usize, (end - start) as usize, since)
+            });
+        }
         let changed = host.buffer_changes();
         let record = |index: u32| heap.handle(index).map(crate::descriptor::record_at);
         let slots = ranges.plan(
@@ -2013,7 +2063,10 @@ impl State {
             shadow.refresh(list, *from, to - from);
         }
         let refreshed = started.elapsed();
-        self.heap_textures(list, heap, host);
+        // With `VICTORY_HEAP_WORKER=1` the worker runs it (`crate::heap_worker`).
+        if !crate::heap_worker::kick(heap) {
+            Self::heap_textures(TexturesInto::List(list), heap, host);
+        }
         let all = started.elapsed();
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(all.as_micros() as u64, Ordering::Relaxed);
@@ -2130,9 +2183,12 @@ impl State {
             return;
         };
         let began = std::time::Instant::now();
+        // The bake draw cannot wait for a later submission: the worker, if
+        // it runs, makes way and hands over what it recorded first.
+        let _pass = crate::heap_worker::on().then(crate::heap_worker::urgent);
         PASS_BUDGET.set(Some((ms, 2 << 30)));
         PASS_BAKE.set(true);
-        let pass = self.heap_textures(list, heap, host);
+        let pass = Self::heap_textures(TexturesInto::List(list), heap, host);
         PASS_BAKE.set(false);
         PASS_BUDGET.set(None);
         bake_flushed(&pass, began.elapsed().as_micros() as u64);
@@ -2168,6 +2224,13 @@ impl State {
         else {
             return false;
         };
+        // What can wait for a later list is the worker's
+        // (`VICTORY_HEAP_WORKER=1`); a bake's run stays here, and the worker
+        // makes way for it and hands over what it recorded first.
+        if !bake && crate::heap_worker::kick(heap) {
+            return true;
+        }
+        let _pass = crate::heap_worker::on().then(crate::heap_worker::urgent);
         let n = EARLY_TEXTURE_PASSES[usize::from(bake)].fetch_add(1, Ordering::Relaxed) + 1;
         // `Some(room percent)` for a bake of the title's loading ([`bake_loading`]).
         let loading = match bake_loading() {
@@ -2192,7 +2255,7 @@ impl State {
         // (and stays marked so, for [`State::early_textures`]).
         let flushing = bake && bake_flush().is_some();
         PASS_BAKE.set(flushing);
-        let mut pass = self.heap_textures(list, heap, host);
+        let mut pass = Self::heap_textures(TexturesInto::List(list), heap, host);
         PASS_BUDGET.set(None);
         if let Some(percent) = loading {
             // A pass takes at most 4,096 due slots: a loading bake runs more
@@ -2206,7 +2269,7 @@ impl State {
                     break;
                 }
                 PASS_BUDGET.set(Some((ms, bytes)));
-                pass = self.heap_textures(list, heap, host);
+                pass = Self::heap_textures(TexturesInto::List(list), heap, host);
                 PASS_BUDGET.set(None);
                 passes += 1;
                 all.uploaded += pass.uploaded;
@@ -2340,12 +2403,16 @@ impl State {
     /// in place of others, and contents changed with no descriptor write,
     /// are missed (hook the page-mapping events for those).
     /// `VICTORY_HEAP_TEXTURES=0` turns it off.
-    fn heap_textures(
-        &self,
-        list: &HostList,
+    /// On a thread of its own (`VICTORY_HEAP_WORKER=1`) the pass records into
+    /// lists of its own, and the slots show what they upload from the
+    /// submission that runs those lists on (`crate::heap_worker`; fxceless,
+    /// victory-fork d4a528ba).
+    pub(crate) fn heap_textures(
+        mut into: TexturesInto<'_>,
         heap: &crate::descriptor::Heap,
         host: &crate::descriptor::host::HostHeap,
     ) -> TexturePass {
+        let ahead = matches!(into, TexturesInto::Ahead(_));
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return TexturePass::default();
@@ -2410,6 +2477,8 @@ impl State {
         static PASSED: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
+        // The worker may run two passes in a frame: no shorter than that.
+        let took = if ahead { took.max(100) } else { took };
         let most = (4000 / took).clamp(16, 256);
         // Remaps already wake these slots. With alternating picks allow a
         // longer interval for polls, keeping the card-full backoff separate.
@@ -2460,6 +2529,30 @@ impl State {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
             }
+            if ahead && crate::heap_worker::make_way() {
+                break;
+            }
+            // On the worker: the record the slot has now, and the texture it
+            // names held while a thread of ours works on it. (Released
+            // meanwhile: nothing to upload.) On the recording thread, as
+            // before, the slot is read where it is needed.
+            let record = if ahead { heap.handle(index).and_then(crate::descriptor::view_and_key) } else { None };
+            let _held = match &record {
+                Some((View::Shader(object, _), _)) => {
+                    let held = crate::resource::hold(*object as This);
+                    if held.is_none() {
+                        host.texture_slot_done(index, write, None);
+                        continue;
+                    }
+                    held
+                }
+                _ => None,
+            };
+            let recorded = || match &record {
+                Some((view, _)) => Some(view.clone()),
+                None if !ahead => heap.handle(index).and_then(crate::descriptor::view),
+                None => None,
+            };
             pass.looked += 1;
             // A placed texture whose memory is not mapped (not streamed in
             // yet, or streamed out again: the heap keeps tens of thousands
@@ -2506,7 +2599,7 @@ impl State {
                 }
             }
             let mut partly = None;
-            if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+            if let Some(View::Placed(false, resource, desc)) = recorded() {
                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
                 // What the host copy reads: without its left-out levels
                 // (`VICTORY_TEXTURE_DROP_MIPS`), `texture::retained_bytes`.
@@ -2535,7 +2628,7 @@ impl State {
             // host's own contents: nothing to bring up to date, and this
             // pass is no use of it (its host copy is made when something
             // uses it, and its slots then: `descriptor::make_waiting`).
-            if let Some(View::Shader(object, _)) = heap.handle(index).and_then(crate::descriptor::view)
+            if let Some(View::Shader(object, _)) = recorded()
                 && crate::resource::buffer_bytes(object as This).is_none()
                 && !crate::resource::title_fills(object as This)
             {
@@ -2589,11 +2682,24 @@ impl State {
                     }
                 }
             }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            // On the worker the slot shows the view once the upload is in
+            // the queue ([`crate::heap_worker::Batch::publish`]); a slot it
+            // takes out of the queue with no upload of its own is made at
+            // once, as here on the recording thread.
+            let make_now = || {
+                if ahead && let Some(handle) = heap.handle(index) {
+                    host.mirror(index, handle, true);
+                }
+            };
+            let view = match &into {
+                TexturesInto::List(_) => heap.handle(index).and_then(|handle| host.mirror(index, handle, true)),
+                TexturesInto::Ahead(_) => record.as_ref().map(|(view, _)| view.clone()),
+            };
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
                 _ => {
+                    make_now();
                     host.texture_slot_done(index, write, None);
                     continue;
                 }
@@ -2608,6 +2714,7 @@ impl State {
             }
             if !title_fills {
                 // a render target, a depth or unordered access texture: the host's own
+                make_now();
                 host.texture_slot_done(index, write, None);
                 continue;
             }
@@ -2616,7 +2723,19 @@ impl State {
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
             if let Some(view) = &view {
-                readable(list, sampled.kind, view);
+                match &mut into {
+                    TexturesInto::List(list) => readable(list, sampled.kind, view),
+                    TexturesInto::Ahead(batch) => {
+                        let Some(list) = batch.list() else {
+                            // No list to record into: the slot stays due.
+                            return pass;
+                        };
+                        readable(list, sampled.kind, view);
+                        if let (Some(handle), Some((_, key))) = (heap.handle(index), &record) {
+                            batch.publish(index, handle, *key);
+                        }
+                    }
+                }
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2662,6 +2781,9 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            if let TexturesInto::Ahead(batch) = &mut into {
+                batch.uploaded(bytes);
+            }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             pass.uploaded += 1;
@@ -4752,5 +4874,52 @@ mod target_bind_tests {
                 println!("TARGET_BINDS_AB,{count},{mode},{:.4}", (samples[9] + samples[10]) as f64 / 2e6);
             }
         }
+    }
+}
+
+/// Port of UwUCammie's test from victory-fork PR 1276 (0e21fcfb), for our
+/// one buffer-pass cache.
+#[cfg(test)]
+mod heap_ranges_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_a_descriptor_heap_releases_its_buffer_pass_cache() {
+        use crate::descriptor::host::HostHeap;
+        use crate::resource::Memory;
+        use std::sync::Arc;
+
+        if crate::host::host().is_none() {
+            eprintln!("no host D3D12 device; skipped");
+            return;
+        }
+        let heap = Box::new(HostHeap::new(false, 4).expect("view heap"));
+        let key = std::ptr::from_ref(heap.as_ref()) as usize;
+        let memory = Memory::zeroed(4096, 4096).expect("test buffer");
+        let start = memory.address();
+        crate::shadow::register(start as usize, start, 4096);
+        let copy = crate::shadow::find(start, 4096).expect("host copy");
+        crate::shadow::unregister(start as usize, start);
+        let weak = Arc::downgrade(&copy);
+
+        let mut picked = HeapPicked::new(false);
+        picked.keep(0, Arc::as_ptr(&copy) as usize, &copy, start, start + 4096, [0; 3], None);
+        HEAP_RANGES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(Default::default)
+            .insert(key, picked);
+        drop(copy);
+        assert!(weak.upgrade().is_some());
+        drop(heap);
+        assert!(weak.upgrade().is_none(), "a freed descriptor heap still owns the buffer copy");
+        assert!(
+            HEAP_RANGES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_none_or(|heaps| !heaps.contains_key(&key)),
+            "a new heap at the address would inherit the entry"
+        );
     }
 }

@@ -153,7 +153,12 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
-        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
+        return host_override(module, name).unwrap_or_else(|| {
+            let proc = host::get_proc_address(module, name);
+            #[cfg(windows)]
+            let proc = super::watch_io::host_export(proc as usize) as *mut c_void;
+            proc
+        });
     };
     // Values below 0x10000 are ordinals; we export by name only.
     if (name as usize) < 0x1_0000 {

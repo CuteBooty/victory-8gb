@@ -219,6 +219,20 @@ named above; and the counters behind `VICTORY_FRAME_WHY2` (queries, culling
 dispatches, the title's and the worker's timelines, descriptor work by
 cause; they change no behaviour).
 
+Written for this tree since the fourth snapshot: the Series S history blend
+and its motion-following version (`VICTORY_UPSCALE_HISTORY`,
+`VICTORY_UPSCALE_HISTORY_MV`); the preparing pool and the split write-watch
+locks (`VICTORY_PREP_THREADS`, `VICTORY_WATCH_SPLIT`); the published clean
+bits (`VICTORY_LIGHT_REFRESH`) and the dirty-page descriptor compare
+(`VICTORY_DESC_DIRTY`), both our own code modelled on a tree from the
+avatarmanz lineage; and the hand ports of: fxceless's texture pass on its
+own thread (victory-fork d4a528ba, PR 1007; `VICTORY_HEAP_WORKER`),
+UwUCammie's release of buffer-pass copies with their descriptor heap
+(victory-fork PR 1276), and ESAT's 2,048-slot sampler heaps
+(avatarmanz/VIctory-7900XTX dd67ae73; `VICTORY_SAMPLER_HEAP_FULL`).
+These were written with Claude Code (Claude Opus and Claude Fable models)
+and OpenAI Codex.
+
 Several contributors' own commits also say they were written with AI
 assistance (Claude Code, OpenAI Codex); commits in triippywhale's fork carry
 the author name "Claude". Commits co-authored by "OpenBot" (fork PRs 462 and

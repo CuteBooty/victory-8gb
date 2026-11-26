@@ -111,6 +111,14 @@ impl Heap {
         (index < self.desc.count).then(|| self.start + u64::from(index) * step)
     }
 
+    /// The heap's memory, `[start, end)`, and its bytes per descriptor.
+    #[cfg(windows)]
+    pub(crate) fn span(&self) -> Option<(u64, u64, u64)> {
+        let step = u64::from(increment(self.desc.kind)?);
+        let end = self.start.checked_add(step * u64::from(self.desc.count))?;
+        Some((self.start, end, step))
+    }
+
     /// The descriptor index of `handle` in this heap, if it lies in it.
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
@@ -830,6 +838,21 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     view_at(i, generation)
+}
+
+/// The view recorded at `handle`, and what says which record that is
+/// (`host::HostHeap::publish`; fxceless, victory-fork d4a528ba).
+#[cfg(windows)]
+pub(crate) fn view_and_key(handle: u64) -> Option<(View, u64)> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: as in `view`.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    Some((view_at(i, generation)?, u64::from(generation) << 32 | u64::from(i)))
 }
 
 /// A description of `N` words, if the title passes one.

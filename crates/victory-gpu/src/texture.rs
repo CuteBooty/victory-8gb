@@ -84,6 +84,9 @@ struct Last {
     behind_guard: bool,
     /// Checks of it through the guards so far (counted up to a few).
     checks: u8,
+    /// The frame it was read in ahead of its submission
+    /// ([`Staging::refresh_ahead`]).
+    ahead: Option<u64>,
 }
 
 /// Whether a texture in view memory whose hash found it changed lately
@@ -984,18 +987,22 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     // When the list is submitted, its copy takes what the staging buffer
     // holds by then: noted before the check below, which sets `dirty`
     // again if it detiles (the next list then uploads once more).
-    {
-        let staging = staging.clone();
-        list.defer_host(move || {
-            staging.uploaded.store(true, Relaxed);
-            staging.dirty.store(false, Relaxed);
-        });
-    }
+    // A step of its own (was a host closure doing `mark_uploaded`), so that
+    // `VICTORY_PREP_THREADS` can keep it after a detile running elsewhere.
+    list.defer_uploaded(staging.clone());
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);
 }
 
 impl Staging {
+    /// A submitted list's upload takes what the buffer holds by then
+    /// ([`upload`]'s step at submission).
+    pub(crate) fn mark_uploaded(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.uploaded.store(true, Relaxed);
+        self.dirty.store(false, Relaxed);
+    }
+
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
         (self.memory as usize, self.layout.size as usize)
@@ -1084,7 +1091,10 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let frame = crate::frame::current();
-            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            // Not in the frames right after a read ahead of the submission
+            // (`refresh_ahead`; None without `VICTORY_HEAP_WORKER`).
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
+                && last.ahead.is_none_or(|at| frame > at + 1);
             let changing = hot() && last.changed.is_some_and(|at| frame < at + HOT_FRAMES);
             // A texture's first checks hash it whatever the turn, so one
             // written behind its guard is found at its second use, not up
@@ -1104,6 +1114,7 @@ impl Staging {
         let read = self.refresh_hashed(last, size);
         // changed with no write the guard saw: hashed at every check now
         if unseen && hash_before.is_some() && last.hash != hash_before && !last.behind_guard {
+            crate::watch::light::unseen_write(start, size);
             last.behind_guard = true;
             tracing::info!(
                 memory = ?self.memory,
@@ -1172,6 +1183,38 @@ impl Staging {
         // above. A partial texture always goes through the mapped copy.
         unsafe { with_refresh_bytes(self.memory, size, mapped, partial || through_copy(), short_hold(), refresh) };
         size
+    }
+
+    /// Detiles the texture memory into the staging buffer ahead of the
+    /// submission, on the thread of `crate::heap_worker`: read through the
+    /// kernel, so that the runtime's remapping never waits for it, whole or
+    /// not at all (the submission then does it, as ever). False if it was
+    /// not read. What the title writes after this is found at submission.
+    /// (fxceless, victory-fork d4a528ba.)
+    pub(crate) fn refresh_ahead(&self) -> bool {
+        let size = self.layout.size as usize;
+        let start = self.memory as usize;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &mut *last;
+        if last.hash.is_some() || last.asked != 0 {
+            // Detiled before: the submission's check is cheap.
+            return true;
+        }
+        let asked =
+            crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
+        let Some((now, _)) = asked else {
+            return false;
+        };
+        with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            last.hash = Some(blake3::hash(read));
+            self.detile(read);
+            last.asked = now;
+            last.ahead = Some(crate::frame::current());
+            true
+        })
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):

@@ -352,17 +352,15 @@ pub(crate) fn own_view(at: usize, len: usize) -> Option<*mut u8> {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    {
-        let mut v = views();
-        v.views.insert(at, (len, section, offset));
-        for k in 0..len.div_ceil(K64) {
-            v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
-        }
+    crate::watch::views_mapped(section, offset, len, || register_view(at, len, section, offset));
+}
+
+pub(crate) fn register_view(at: usize, len: usize, section: usize, offset: u64) {
+    let mut v = views();
+    v.views.insert(at, (len, section, offset));
+    for k in 0..len.div_ceil(K64) {
+        v.pages.entry((section, offset + (k * K64) as u64)).or_default().push(at + k * K64);
     }
-    // This view is writable from now on: a guard over the same bytes at
-    // another view must look at them again, and the pages are noted written
-    // there (`crate::watch`).
-    crate::watch::views_mapped(section, offset, len);
 }
 
 /// For the census (`crate::census`): how many bytes of `[at, at + len)` are
@@ -447,6 +445,44 @@ pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     pages_of_with_limit(&views(), page, 1..=usize::MAX)
+}
+
+/// Call only under the guards lock. A bounded guard lookup returning no
+/// siblings is ambiguous (unknown, unique, or too many). Publication needs
+/// positive evidence for the complete physical page and every one of its views.
+pub(crate) fn publishable_view(at: usize, check: impl FnOnce(usize, u64, &[usize]) -> bool)
+    -> Result<bool, crate::watch::light::Miss>
+{
+    use crate::watch::light::Miss;
+    let v = views();
+    let Some((&base, &(len, section, offset))) = v.views.range(..=at).next_back() else { return Err(Miss::NoView) };
+    let within = at - base;
+    if within >= len { return Err(Miss::NoView); }
+    if !base.is_multiple_of(K64) || !offset.is_multiple_of(K64 as u64) || len.saturating_sub(within) < K64 {
+        return Err(Miss::Unknown);
+    }
+    let key = offset + within as u64;
+    let shown = v.pages.get(&(section, key)).ok_or(Miss::Unknown)?;
+    if shown.len() > crate::watch::MANY_VIEWS { return Err(Miss::Many); }
+    if !shown.contains(&at) || !shown.iter().all(|&a| {
+        v.views.range(..=a).next_back().is_some_and(|(&b, &(n, s, o))| {
+            let k = a - b;
+            a.is_multiple_of(K64) && k.is_multiple_of(K64) && n.saturating_sub(k) >= K64
+                && s == section && o.checked_add(k as u64) == Some(key)
+        })
+    }) { return Err(Miss::Unknown); }
+    Ok(check(section, key, shown))
+}
+
+/// Physical spans pinned by an I/O request made through a title address.
+pub(crate) fn physical_spans(at: usize, end: usize) -> Vec<(usize, u64, usize)> {
+    if at >= end { return Vec::new(); }
+    let v = views();
+    v.views.range(..=at).next_back().into_iter().chain(v.views.range(at + 1..end))
+        .filter_map(|(&base, &(bytes, section, offset))| {
+            let (lo, hi) = (at.max(base), end.min(base.saturating_add(bytes)));
+            (lo < hi).then(|| (section, offset + (lo - base) as u64, hi - lo))
+        }).collect()
 }
 
 /// The guard only acts on keys with 2..=MANY_VIEWS entries. In particular

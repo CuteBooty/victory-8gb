@@ -119,9 +119,14 @@ pub(crate) struct HostHeap {
     placed: Mutex<Spans>,
 }
 
-#[cfg(feature = "diagnostics")]
 impl Drop for HostHeap {
     fn drop(&mut self) {
+        // The buffer pass's entry for this heap goes with it, in every build
+        // (UwUCammie, victory-fork PR 1276; sampler heaps have none).
+        if !self.sampler {
+            crate::draw::forget_heap_ranges(self);
+        }
+        #[cfg(feature = "diagnostics")]
         crate::copystat::dynamic_returned(self.dynamic.saturating_sub(*self.free.get_mut()));
     }
 }
@@ -1354,6 +1359,9 @@ fn heap_pass_unmarked() -> bool {
 }
 
 thread_local! {
+    /// This thread is inside [`HostHeap::publish`]: the slot it makes
+    /// stays out of the queue of textures picked by index.
+    static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// This thread is in the pass over the heap's buffer views ([`passing`]).
     static PASSING: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
@@ -1372,6 +1380,27 @@ pub(crate) fn passing() -> impl Drop {
     PASSING.with(|p| p.set(Some(heap_pass_unmarked())));
     Passing
 }
+
+/// D3D12's most samplers in a shader-visible sampler heap
+/// (`D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE`), and one more than the
+/// highest sampler index the translator lets a shader use.
+const SAMPLER_SLOTS: u32 = 2048;
+
+/// Whether host sampler heaps are made with all [`SAMPLER_SLOTS`] slots, the
+/// last kept null (`VICTORY_SAMPLER_HEAP_FULL=1`; off by default: as big as
+/// the title's heap, as before). ESAT, avatarmanz/VIctory-7900XTX dd67ae73.
+fn sampler_heap_full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(test)]
+    if SAMPLER_HEAP_FULL_TEST.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLER_HEAP_FULL").is_some_and(|v| v == "1"))
+}
+
+/// The switch as a test sets it (a full heap harms no other test).
+#[cfg(test)]
+static SAMPLER_HEAP_FULL_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -1420,7 +1449,27 @@ impl HostHeap {
                 );
             });
         }
-        let (heap, count, size) = if null == 0 {
+        let (heap, count, size) = if sampler && sampler_heap_full() {
+            // `VICTORY_SAMPLER_HEAP_FULL=1`: the translator clamps sampler
+            // indices to 2,047 (`victory-shader`, emit/shader.rs), so a
+            // sampler heap is made with all 2,048 slots D3D12 allows a
+            // shader-visible sampler heap, whatever the title's count, and
+            // the last stays null (`fill_null` below makes every slot a
+            // point sampler, and no title slot reaches it): a clamped index
+            // never reads past a small heap. Port of ESAT
+            // (avatarmanz/VIctory-7900XTX dd67ae73).
+            let fitted = count.min(SAMPLER_SLOTS - 1);
+            if fitted < count {
+                tracing::warn!(count, "host sampler heap capped at 2,048: the title's sampler slot 2,047 reads a point sampler");
+            }
+            match make(SAMPLER_SLOTS) {
+                Ok(heap) => (heap, fitted, SAMPLER_SLOTS),
+                Err(e) => {
+                    tracing::warn!(error = %e, count, sampler, "no host descriptor heap");
+                    return None;
+                }
+            }
+        } else if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
                 Err(e) => {
@@ -1925,6 +1974,9 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        if PUBLISHING.with(std::cell::Cell::get) {
+            return;
+        }
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -2326,6 +2378,24 @@ impl HostHeap {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }
+    }
+
+    /// Makes host slot `index` from the record at `handle` if it is still
+    /// the one with `key`, whose texture's upload is in the queue now
+    /// (`crate::heap_worker`; fxceless, victory-fork d4a528ba). The slot's
+    /// place in the queue of textures picked by index was settled when
+    /// that upload was recorded, and stays as it is. False if the title
+    /// wrote the slot again.
+    pub(crate) fn publish(&self, index: u32, handle: u64, key: u64) -> bool {
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG || u64::from(generation) << 32 | u64::from(i) != key {
+            return false;
+        }
+        PUBLISHING.with(|p| p.set(true));
+        let shown = self.mirror(index, handle, true).is_some();
+        PUBLISHING.with(|p| p.set(false));
+        shown
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -3684,6 +3754,26 @@ fn debug_null() -> Option<&'static DebugNull> {
 mod tests {
     use super::*;
 
+    /// With `VICTORY_SAMPLER_HEAP_FULL=1` every host sampler heap backs all
+    /// 2,048 descriptors and keeps slot 2,047 out of the title's reach, so
+    /// the translator's clamp to 2,047 never reads past a small heap
+    /// (ESAT, avatarmanz/VIctory-7900XTX dd67ae73).
+    #[test]
+    fn sampler_heaps_back_2048_slots_and_reserve_null_sentinel() {
+        SAMPLER_HEAP_FULL_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
+        let small = HostHeap::new(true, 16);
+        let full = HostHeap::new(true, 2048);
+        SAMPLER_HEAP_FULL_TEST.store(false, std::sync::atomic::Ordering::Relaxed);
+        let (Some(small), Some(full)) = (small, full) else {
+            return; // no host GPU
+        };
+        // SAFETY: live heap queries.
+        assert_eq!(unsafe { small.heap.GetDesc().NumDescriptors }, SAMPLER_SLOTS);
+        assert_eq!(small.count, 16);
+        assert_eq!(unsafe { full.heap.GetDesc().NumDescriptors }, SAMPLER_SLOTS);
+        assert_eq!(full.count, SAMPLER_SLOTS - 1);
+    }
+
     fn rr(size: u64, offset: u64, len: u64) -> (Option<(u64, u32)>, Option<Cut>) {
         let (range, cut) = raw_range(size, offset, len);
         (range.map(|v| (v.first, v.elements)), cut)
@@ -4717,6 +4807,42 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [1]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// A slot whose texture was uploaded ahead shows it when it is
+    /// published, and does not go back into the queue of textures picked by
+    /// index for that; one the title wrote again is left alone (fxceless,
+    /// victory-fork d4a528ba).
+    #[test]
+    fn a_published_slot_stays_out_of_the_queue() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let made = |index: usize| heap.made.lock().unwrap_or_else(|e| e.into_inner())[index] != 0;
+        // 64x64 BC7, one mip, at an address no test and no title uses.
+        let view = |at: u64| {
+            let mut desc = [0u32; 16];
+            (desc[0], desc[1], desc[2], desc[5]) = (98, 4, 5768, 1);
+            (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        let mut title = [0u32; 8];
+        let handle = title.as_mut_ptr() as u64;
+        crate::descriptor::record(handle, view(0x7fec_0000_0000));
+        let (first, key) = crate::descriptor::view_and_key(handle).unwrap();
+        assert!(heap.note_buffer(1, Some(&first), false).is_empty());
+        let (index, write) = heap.texture_slots_due(u64::MAX, 8, true).0[0];
+        assert_eq!(index, 1);
+        // Its upload was recorded: out of the queue, the slot not made yet.
+        heap.texture_slot_done(1, write, None);
+        assert!(!made(1));
+        assert!(heap.publish(1, handle, key));
+        assert!(made(1));
+        assert!(heap.texture_slots_due(u64::MAX, 8, true).0.is_empty());
+        // Written again since the upload was recorded.
+        crate::descriptor::record(handle, view(0x7feb_0000_0000));
+        assert!(!heap.publish(1, handle, key));
+        assert_ne!(crate::descriptor::view_and_key(handle).unwrap().1, key);
     }
 
     /// A slot a draw read through a table leaves the queue; the title's

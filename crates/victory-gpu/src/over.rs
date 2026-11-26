@@ -21,6 +21,8 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
+pub(crate) mod history;
+
 const SOURCE: &str = r#"
 Texture2D<float4> plane : register(t0);
 SamplerState bilinear : register(s0);
@@ -358,12 +360,24 @@ static STRETCHER: Mutex<Option<Stretch>> = Mutex::new(None);
 /// is far more than it keeps.
 const STRETCH_RING: u32 = 64;
 
-fn make_stretch(device: &ID3D12Device) -> windows::core::Result<Stretch> {
+fn stretch_heap(device: &ID3D12Device, views: u32) -> windows::core::Result<ID3D12DescriptorHeap> {
+    unsafe {
+        device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: STRETCH_RING * views,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+    }
+}
+
+fn make_stretch(device: &ID3D12Device, temporal: bool) -> windows::core::Result<Stretch> {
     use windows::core::s;
-    let cs = crate::host::compile(STRETCH, s!("stretch"), s!("cs_5_1"))?;
+    let (source, pairs, words) = if temporal { (history::SOURCE, 2, 9) } else { (STRETCH, 1, 4) };
+    let cs = crate::host::compile(source, s!("stretch"), s!("cs_5_1"))?;
     let views = [
-        range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0),
-        range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1),
+        D3D12_DESCRIPTOR_RANGE { NumDescriptors: pairs, ..range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0) },
+        D3D12_DESCRIPTOR_RANGE { NumDescriptors: pairs, ..range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, pairs) },
     ];
     let sizes = D3D12_ROOT_PARAMETER {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
@@ -371,7 +385,7 @@ fn make_stretch(device: &ID3D12Device) -> windows::core::Result<Stretch> {
             Constants: D3D12_ROOT_CONSTANTS {
                 ShaderRegister: 0,
                 RegisterSpace: 0,
-                Num32BitValues: 4,
+                Num32BitValues: words,
             },
         },
         ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -394,13 +408,7 @@ fn make_stretch(device: &ID3D12Device) -> windows::core::Result<Stretch> {
             ..Default::default()
         };
         let pipeline: ID3D12PipelineState = device.CreateComputePipelineState(&desc)?;
-        let views: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: STRETCH_RING * 2,
-                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                NodeMask: 0,
-            })?;
+        let views = stretch_heap(device, pairs * 2)?;
         Ok(Stretch {
             root,
             pipeline,
@@ -410,6 +418,20 @@ fn make_stretch(device: &ID3D12Device) -> windows::core::Result<Stretch> {
             next: 0,
         })
     }
+}
+
+fn rendered_size(render: [u32; 2], from: &D3D12_RESOURCE_DESC) -> [u32; 2] {
+    let size = [from.Width as u32, from.Height];
+    [0, 1].map(|i| if render[i] == 0 { size[i] } else { render[i].min(size[i]) })
+}
+
+fn stretch_sizes(rendered: [u32; 2], to: &D3D12_RESOURCE_DESC, from: &D3D12_RESOURCE_DESC) -> [f32; 4] {
+    [
+        rendered[0] as f32 / from.Width as f32,
+        rendered[1] as f32 / from.Height as f32,
+        1.0 / to.Width as f32,
+        1.0 / to.Height as f32,
+    ]
 }
 
 /// A typeless colour format as the typed one shaders read and write.
@@ -448,7 +470,7 @@ pub(crate) fn record_stretch(
     if made.is_none() {
         // Tried again at the next dispatch if it fails, as the pass over a
         // present is: a failure need not last.
-        *made = match make_stretch(device) {
+        *made = match make_stretch(device, false) {
             Ok(p) => {
                 tracing::info!("the upscaler's output is made by a plain stretch of its colour input");
                 Some(p)
@@ -463,19 +485,24 @@ pub(crate) fn record_stretch(
         };
     }
     let Some(p) = made.as_mut() else { return false };
-    let slot = (p.next % STRETCH_RING) * 2;
+    let sizes = stretch_sizes(rendered_size(render, &from), &to, &from);
+    dispatch_stretch(p, device, list, (target, &to), (source, &from), &sizes, None);
+    true
+}
+
+fn dispatch_stretch(
+    p: &mut Stretch,
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    (target, to): (&ID3D12Resource, &D3D12_RESOURCE_DESC),
+    (source, from): (&ID3D12Resource, &D3D12_RESOURCE_DESC),
+    sizes: &[f32],
+    history: Option<(&ID3D12Resource, &ID3D12Resource)>,
+) {
+    let pairs = if history.is_some() { 2 } else { 1 };
+    let slot = (p.next % STRETCH_RING) * 2 * pairs;
     p.next = p.next.wrapping_add(1);
     let (width, height) = (to.Width as u32, to.Height);
-    let rendered = [
-        if render[0] == 0 { from.Width as u32 } else { render[0].min(from.Width as u32) },
-        if render[1] == 0 { from.Height } else { render[1].min(from.Height) },
-    ];
-    let sizes = [
-        rendered[0] as f32 / from.Width as f32,
-        rendered[1] as f32 / from.Height as f32,
-        1.0 / width as f32,
-        1.0 / height as f32,
-    ];
     let read = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: typed(from.Format),
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -503,15 +530,19 @@ pub(crate) fn record_stretch(
             ptr: p.views.GetGPUDescriptorHandleForHeapStart().ptr + u64::from(slot * p.step),
         };
         device.CreateShaderResourceView(source, Some(&read), cpu(0));
-        device.CreateUnorderedAccessView(target, None, Some(&written), cpu(1));
+        device.CreateUnorderedAccessView(target, None, Some(&written), cpu(pairs));
+        if let Some((previous, next)) = history {
+            let hist = D3D12_SHADER_RESOURCE_VIEW_DESC { Format: written.Format, ..read };
+            device.CreateShaderResourceView(previous, Some(&hist), cpu(1));
+            device.CreateUnorderedAccessView(next, None, Some(&written), cpu(3));
+        }
         list.SetDescriptorHeaps(&[Some(p.views.clone())]);
         list.SetComputeRootSignature(&p.root);
         list.SetPipelineState(&p.pipeline);
-        list.SetComputeRoot32BitConstants(0, 4, sizes.as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(0, sizes.len() as u32, sizes.as_ptr().cast(), 0);
         list.SetComputeRootDescriptorTable(1, gpu);
         list.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
     }
-    true
 }
 
 #[cfg(test)]

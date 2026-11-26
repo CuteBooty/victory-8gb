@@ -186,6 +186,86 @@ by draw count against runs of the same night):
   guards' lock (193 thread-ms a frame) and the frame is no shorter (222 ms at
   7,000-9,000 draws, 272 ms above 9,000).
 
+## What changed since the fourth snapshot
+
+Everything new in this snapshot is behind a switch that is off unless set,
+so without switches the tree behaves as the fourth snapshot did. The parts
+were written and first run in one night (2026-11-26) on the test machine;
+each was run once or twice, none long. Read the numbers as first readings.
+
+- **Series S: a history blend after the stretch**
+  (`VICTORY_UPSCALE_HISTORY=<blend>`). In Series S the title renders
+  1280x720 with a different sub-pixel offset each frame and asks its
+  upscaler to make 1920x1080 of it. This family answers that request with a
+  plain stretch of the current frame, so each shown frame is one raw sample:
+  leaf edges are grainy, thin wires are dotted, and a distant sign's border
+  shows a different part each frame. With the blend, standing still, the
+  player's words were "the background and power lines look wayyyy better".
+  A plain blend trails badly in motion at 5 fps (0.85: "trails real bad";
+  0.5 with the colour clamp, `VICTORY_UPSCALE_HISTORY_MV=1`: "much better";
+  0.35: "still feels dreamy").
+- **The same, following motion** (`VICTORY_UPSCALE_HISTORY_MV=2`). History
+  is moved along the motion vectors and compared against the depth the
+  title hands to the upscaler; it is dropped where a nearer object moved
+  away, where the old position is off screen and where the colour no longer
+  fits its surroundings. Still pixels accumulate for up to 16 frames, moving
+  ones lean on the current frame. The title's own upscale-context flags are
+  read when it creates the context (seen here: `0x29`, depth inverted,
+  motion vectors without jitter). One short run: 7 % of pixels rejected,
+  mean motion 13 pixels, no errors. Not yet judged by eye for long.
+  `VICTORY_UPSCALE_MV_JITTERED`, `VICTORY_UPSCALE_DEPTH_INVERTED` and
+  `VICTORY_UPSCALE_MV_SCALE=x,y` override the conventions.
+- **The texture part of the heap pass on its own thread**
+  (`VICTORY_HEAP_WORKER=1`, needs `VICTORY_LATE_WAIT`; fork PR 1007, hand
+  ported, with a fix for slots the worker took but never made, and a stop
+  path). One short run: 75 ms a frame of work moved off the recording
+  threads, recording threads waited 0.02 ms for it. No timing comparison
+  yet.
+- **Refreshes of title memory proven unwritten are skipped**
+  (`VICTORY_LIGHT_REFRESH=1`; self-check `VICTORY_LIGHT_REFRESH_CHECK=<n>`).
+  Blocks of guarded view memory are published as clean with the stamp of
+  the last tracked write; a refresh or a copy that asks about a published
+  range is answered without the guards' lock. Writes that bypass tracking
+  (kernel reads into title memory, protection changes, asynchronous I/O)
+  open a window or a quarantine. Two runs with the check on (7,148 samples
+  in the first), no mismatch, picture unharmed. About 945
+  refreshes a frame skipped; preparing 87 ms a frame against 105-146 on
+  plain runs, measured with the check on and other work on the machine, so
+  not yet a clean comparison. Most asks (about 5,200 a frame) still fall
+  back.
+- **Preparing on a pool of threads** (`VICTORY_PREP_THREADS=4`) and **the
+  write-watch query under per-region locks** (`VICTORY_WATCH_SPLIT=1`).
+  Alone they did not shorten the frame here: the threads queue on the
+  guards' lock. They are in the tree because the light refresh was measured
+  with them.
+- **Descriptor records compared only on pages that were written**
+  (`VICTORY_DESC_DIRTY=1`; self-check `VICTORY_DESC_DIRTY_CHECK=<n>`). On
+  this title it skips nothing in mode 1: the heaps sit in physical-page
+  views, which the kernel's write watch does not cover (the 5-second line
+  names the cause). Mode 2 uses the guards for that memory and has not been
+  run. The whole compare is small in any case (about 240,000 records, a few
+  milliseconds a frame).
+- **Buffer-pass copies are released with their descriptor heap** (fork PR
+  1276, hand ported; always on). Before, the cache of host copies was keyed
+  by the heap's address and never emptied, so a destroyed heap leaked its
+  copies and a new heap at the same address inherited a stale cache.
+- **Host sampler heaps of 2,048 slots** (`VICTORY_SAMPLER_HEAP_FULL=1`,
+  off). The translator clamps sampler indices to 2,047, but a host heap was
+  only as large as the title's, so a clamped index could read past its end.
+  Not yet run.
+- A `why2 heap worker` line joins the `VICTORY_FRAME_WHY2` counters.
+
+What the same night showed without a code change:
+
+- The black shade is the title's ray-traced lighting walking an empty
+  scene: the console's structure builder (about 52 compute programs, the
+  roughly 2,700 "dropped without a host pipeline" draws a frame) is off in
+  this family unless `VICTORY_BVH_BUILDER=1`, which costs seconds a frame.
+  The eight compute programs this card refuses are unrelated to it.
+- Fork PR 1274 (the 2 MiB sections of the third snapshot, proposed to the
+  fork) was run by others on the fork's own code: remapping 42.8 to 5.0 ms
+  a frame on an RTX 3080, no change in frame rate there.
+
 ## Known problems
 
 - Slow (see the frame times above).
@@ -284,6 +364,14 @@ Defaults as the code reads them. "On" switches are turned off with `=0`;
 | `VICTORY_AMBIENT` | off | a constant least amount of indirect light in place of the title's bounced light; `=<level>` sets it (0.6 recommended, `0` is none, an unreadable value means 0.6) |
 | `VICTORY_RAW_VIEW_CLAMP` | on | a raw buffer view stays inside its buffer: a range past the end is shortened to the whole dwords that fit, an unaligned or empty one becomes a null view; `0`: the old descriptors, and no counting |
 | `VICTORY_FRAME_WHY2` | off | 5-second lines beginning `why2`: queries, culling dispatches, the title's and the worker's timelines, descriptor work by cause (diagnostic; changes no behaviour) |
+| `VICTORY_UPSCALE_HISTORY` | off | Series S: blends each stretched frame with the previous ones before the interface is drawn; `=<blend>` from 0 to 1 is the most weight history may have (0.9 with `_MV=2`, 0.5 with `_MV=1`) |
+| `VICTORY_UPSCALE_HISTORY_MV` | off | `1`: history clamped to the current 3x3 colour range; `2`: history follows the title's motion vectors, with depth and colour rejection and a weight per pixel |
+| `VICTORY_HEAP_WORKER` | off | the texture part of the descriptor heap pass runs on a thread of its own (needs `VICTORY_LATE_WAIT`); textures can show a frame late |
+| `VICTORY_LIGHT_REFRESH` | off | refreshes and copies of guarded title memory proven unwritten are answered from published clean bits; `VICTORY_LIGHT_REFRESH_CHECK=<n>` compares every n-th skipped block and answer anyway and counts mismatches |
+| `VICTORY_PREP_THREADS` | off | `=<n>`: a submission's texture refreshes and buffer copies are prepared on n threads |
+| `VICTORY_WATCH_SPLIT` | off | the kernel's write-watch query runs under per-region locks instead of the journal's lock |
+| `VICTORY_DESC_DIRTY` | off | `1`: descriptor records on pages not written since the last pass are not compared (write-watched memory only); `2`: also guarded view memory (not yet run); `VICTORY_DESC_DIRTY_CHECK=<n>` samples skipped ranges |
+| `VICTORY_SAMPLER_HEAP_FULL` | off | host sampler heaps are made with 2,048 slots, the last a null sampler (not yet run) |
 
 ## Building
 
