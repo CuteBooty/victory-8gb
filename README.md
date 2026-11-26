@@ -299,8 +299,14 @@ Run the title:
 
 ```powershell
 cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+target\release\victory.exe run <game dir>\<the title's exe> --execute --console series-s
 ```
+
+`--console series-s` selects the title's Series S mode, the only mode this tree
+is tested in; without it the title runs in Series X mode. The game folder can be
+anywhere outside this repository: the path on this command line is the one
+used. Set the switches from "Switches used on an 8 GB card" in the environment
+first.
 
 `VICTORY_SKIP_BINK=1` skips the title's movies that play once (logos and
 the intro); `VICTORY_SKIP_BINK=all` skips the looping ones too, so menu
