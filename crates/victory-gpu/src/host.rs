@@ -408,8 +408,9 @@ fn stood(since: std::time::Instant) {
 struct CardClock {
     fence: ID3D12Fence,
     /// Signals sent so far; and, while the card has reached the last of
-    /// them, since when and what [`worked`] said then.
-    state: Mutex<(u64, Option<(std::time::Instant, u64)>)>,
+    /// them, since when and what [`worked`] said then. The final field groups
+    /// WHY2 submit timestamps until this clock observes their covering fence.
+    state: Mutex<(u64, Option<(std::time::Instant, u64)>, crate::frame_why::FlightBatch)>,
     sent: std::sync::Condvar,
 }
 
@@ -427,17 +428,18 @@ fn card_clock_watch(clock: &'static CardClock) {
     };
     let mut seen = 0;
     loop {
-        let target = {
+        let (target, batch) = {
             let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
             while state.0 == seen {
                 state = clock.sent.wait(state).unwrap_or_else(|e| e.into_inner());
             }
-            state.0
+            (state.0, std::mem::take(&mut state.2))
         };
         // SAFETY: the clock's fence and this thread's event.
         unsafe {
-            if clock.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+            if clock.fence.SetEventOnCompletion(target, event).is_ok()
+                && WaitForSingleObject(event, INFINITE) == windows::Win32::Foundation::WAIT_OBJECT_0 {
+                batch.observed();
             }
         }
         seen = target;
@@ -3423,6 +3425,7 @@ fn land_after_submission() {
 /// value while the submitting thread waits for that thread would never
 /// see it.
 fn late_helper() {
+    crate::frame_why::role(crate::frame_why::Role::Helper);
     let Some(host) = host() else {
         return;
     };
@@ -3513,9 +3516,12 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) -> u64 {
     LATE_STATS[why].fetch_add(1, Ordering::Relaxed);
     let was_working = working(false);
     let waiting = std::time::Instant::now();
+    let cause = if why == WHY_READ { crate::frame_why::Phase::Memory } else { crate::frame_why::Phase::RelayWait };
+    let relay_wait = crate::frame_why::span(cause);
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
+    drop(relay_wait);
     drop(line);
     stood(waiting);
     working(was_working);
@@ -3573,6 +3579,7 @@ struct RelayFetch {
 /// here, as soon as the card has run them ([`early_table_release`]), not
 /// when the lists are reset or let go.
 fn relay_worker() {
+    crate::frame_why::role(crate::frame_why::Role::Relay);
     let Some(host) = host() else {
         return;
     };
@@ -3586,6 +3593,7 @@ fn relay_worker() {
             let mut line = line();
             loop {
                 if line.line.is_empty() {
+                    let _idle = crate::frame_why::span(crate::frame_why::Phase::Idle);
                     line = RELAY_MOVED.wait(line).unwrap_or_else(|e| e.into_inner());
                     continue;
                 }
@@ -3640,6 +3648,7 @@ fn relay_worker() {
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
                     host.fence.SetEventOnCompletion(target, event).map(|()| {
+                        let _fence = crate::frame_why::span(crate::frame_why::Phase::Gpu);
                         WaitForSingleObject(event, INFINITE);
                     })
                 };
@@ -4295,7 +4304,7 @@ impl Host {
                 let fence = unsafe { self.device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }.ok()?;
                 Some(CardClock {
                     fence,
-                    state: Mutex::new((0, None)),
+                    state: Mutex::new((0, None, Default::default())),
                     sent: std::sync::Condvar::new(),
                 })
             })
@@ -4311,14 +4320,15 @@ impl Host {
     /// Lists of ours just went to the queue: the clock's signal goes
     /// behind them, and an idle stretch of the card, if one was under way,
     /// ends here ([`CARD_CLOCK_US`]).
-    fn card_sent(&self) {
+    fn card_sent(&self, executed: Option<std::time::Instant>) {
         let Some(clock) = self.card_clock() else {
             return;
         };
         let mut state = clock.state.lock().unwrap_or_else(|e| e.into_inner());
         state.0 += 1;
         // SAFETY: our queue and the clock's fence.
-        let _ = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        let signalled = unsafe { self.queue.Signal(&clock.fence, state.0) };
+        if let Some(start) = executed && signalled.is_ok() { state.2.sent(start); }
         if let Some((since, worked_then)) = state.1.take() {
             CARD_CLOCK_US[0].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
             CARD_CLOCK_US[1].fetch_add(worked().saturating_sub(worked_then), Ordering::Relaxed);
@@ -5091,7 +5101,10 @@ impl Host {
                     q.ExecuteCommandLists(&lists);
                     q.Signal(&fence, sent)?;
                     fence.SetEventOnCompletion(sent, event)?;
-                    WaitForSingleObject(event, INFINITE);
+                    {
+                        let _fence = crate::frame_why::span(crate::frame_why::Phase::Gpu);
+                        WaitForSingleObject(event, INFINITE);
+                    }
                     if beside {
                         // Whatever had started by now may have been writing
                         // these pieces while they came down (counted before a
@@ -5109,10 +5122,13 @@ impl Host {
                     self.queue.ExecuteCommandLists(&lists);
                     let after = *order;
                     drop(order);
-                    self.card_sent();
+                    self.card_sent(None);
                     self.queue.Signal(&fence, sent)?;
                     fence.SetEventOnCompletion(sent, event)?;
-                    WaitForSingleObject(event, INFINITE);
+                    {
+                        let _fence = crate::frame_why::span(crate::frame_why::Phase::Gpu);
+                        WaitForSingleObject(event, INFINITE);
+                    }
                     after
                 };
                 Ok(after)
@@ -5258,6 +5274,7 @@ impl Host {
                 queue.Signal(&fence, sent)?;
                 if fence.GetCompletedValue() < sent {
                     fence.SetEventOnCompletion(sent, event)?;
+                    let _fence = crate::frame_why::span(crate::frame_why::Phase::Gpu);
                     if WaitForSingleObject(event, INFINITE) != windows::Win32::Foundation::WAIT_OBJECT_0 {
                         return Err(windows::core::Error::from_thread());
                     }
@@ -5299,6 +5316,7 @@ impl Host {
     /// it; then the line; and last every flight's ranges are done with.
     /// Title memory is complete before the title is told anything.
     fn relay_land(&self, mut items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+        let _land = crate::frame_why::span(crate::frame_why::Phase::Land);
         let landing = std::time::Instant::now();
         // The card has run these flights (only flights whose fence has
         // passed are taken, [`landable`]): their descriptor tables' slots go
@@ -5333,7 +5351,9 @@ impl Host {
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
                 let step = std::time::Instant::now();
+                let card_merge = crate::frame_why::span(crate::frame_why::Phase::CardMerge);
                 self.relay_card_back(&plans, fetch, behind, landed);
+                drop(card_merge);
                 LAND_SPLIT[0].fetch_add(step.elapsed().as_micros() as u64, Ordering::Relaxed);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
@@ -5351,7 +5371,9 @@ impl Host {
                     }
                 }
                 let step = std::time::Instant::now();
+                let merge = crate::frame_why::span(crate::frame_why::Phase::Merge);
                 relay_hand_back(&back);
+                drop(merge);
                 LAND_SPLIT[1].fetch_add(step.elapsed().as_micros() as u64, Ordering::Relaxed);
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -5373,7 +5395,9 @@ impl Host {
                     prior = flight.frame_end.clone();
                     last = flight.number;
                     let step = std::time::Instant::now();
+                    let publish = crate::frame_why::span(crate::frame_why::Phase::Publish);
                     flight.read_backs();
+                    drop(publish);
                     LAND_SPLIT[3].fetch_add(step.elapsed().as_micros() as u64, Ordering::Relaxed);
                     if let Some(card) = flight.card {
                         self.card_done(card);
@@ -5382,11 +5406,13 @@ impl Host {
                     backs.extend(flight.back);
                 }
                 Late::Write(at, what, bytes) => {
+                    let _writes = crate::frame_why::span(crate::frame_why::Phase::Writes);
                     what.write(at as *mut u8, bytes);
                     LAND_SPLIT[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                     LAND_SPLIT[5].fetch_add(1, Ordering::Relaxed);
                 }
                 Late::Signal(fence, value) => {
+                    let _writes = crate::frame_why::span(crate::frame_why::Phase::Writes);
                     crate::fence::set(fence as crate::object::This, value);
                     LAND_SPLIT[4].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                     LAND_SPLIT[5].fetch_add(1, Ordering::Relaxed);
@@ -5518,7 +5544,7 @@ impl Host {
                     }
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
-                    self.card_sent();
+                    self.card_sent(None);
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
@@ -5970,7 +5996,10 @@ impl Host {
         crate::copystat::submission_begins();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        let submit_lock = crate::frame_why::span(crate::frame_why::Phase::SubmitLock);
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        drop(submit_lock);
+        let prepare = crate::frame_why::span(crate::frame_why::Phase::Prepare);
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -6098,20 +6127,22 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        drop(prepare);
         let prepared = std::time::Instant::now();
         if late {
             // All CPU preparation reads are finished, including earlier
             // occurrences of a repeated list.
             if let Some(ready) = ready {
-                let _ = ready.try_send(());
+                let _ = ready.try_send(crate::queue::Ack::Prepared);
             }
             *submitted += 1;
+            let executed = crate::frame_why::enabled().then(std::time::Instant::now);
             // SAFETY: closed lists; the fence is ours.
             let signalled = unsafe {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
-            self.card_sent();
+            self.card_sent(executed);
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
@@ -6152,8 +6183,9 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
+                let _fence = crate::frame_why::span(crate::frame_why::Phase::Gpu);
                 self.queue.ExecuteCommandLists(group);
-                self.card_sent();
+                self.card_sent(crate::frame_why::enabled().then_some(started));
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
@@ -8619,6 +8651,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            crate::frame_why::due();
             frame_end::log_interval();
             back_age::log_interval();
             feedback::log_interval();
@@ -8682,6 +8715,7 @@ impl Meter {
                     per_frame(6) / 1e3
                 );
             }
+            let [raw_srv, raw_uav] = crate::descriptor::host::raw_view_counts();
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -8690,7 +8724,8 @@ impl Meter {
                  {indirect:.0} indirect; heap buffers {picked:.1} passes {picked_ms:.1} ms ({picked_mode}: {picked_slots:.0} slots looked at {picked_look:.1} ms, \
                  {picked_copies:.0} copies refreshed {picked_refresh:.1} ms, textures {picked_tex:.1} ms);                  texture slots written so far: {placed} placed, {objects} of objects; \
                  textures picked by index: {picked_textures} uploaded so far ({picked_mb} MB), \
-                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}",
+                 {picked_waiting} waiting, {picked_away} passed over unmapped; depth textures with                  unordered access: {du0} made, bound as depth {du1}x, cleared as depth {du2}x,                  unordered views refused {du3}x; buffer views left null as the host would refuse them: {refused}; \
+                 raw view clamp (past end, shortened, sub-dword, unaligned) since start: SRV {raw_srv:?}, UAV {raw_uav:?}",
                 picked_textures = crate::draw::HEAP_TEXTURES.load(Ordering::Relaxed),
                 picked_mb = crate::draw::HEAP_TEXTURE_BYTES.load(Ordering::Relaxed) >> 20,
                 picked_waiting = crate::draw::HEAP_TEXTURES_WAITING.load(Ordering::Relaxed),

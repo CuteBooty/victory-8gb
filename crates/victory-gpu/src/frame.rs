@@ -143,9 +143,11 @@ pub(crate) extern "system" fn wait(
         wait = Duration::ZERO;
     }
     let hr = if wait > limit {
+        let _event = crate::frame_why::span(crate::frame_why::Phase::Event);
         std::thread::sleep(limit);
         TIMEOUT
     } else {
+        let _event = crate::frame_why::span(crate::frame_why::Phase::Event);
         std::thread::sleep(wait);
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK

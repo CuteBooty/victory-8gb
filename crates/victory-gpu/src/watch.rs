@@ -1388,6 +1388,7 @@ fn spans() -> std::sync::MutexGuard<'static, Spans> {
 
 /// Waits until a read or a change ends.
 fn spans_wait(mut s: std::sync::MutexGuard<'static, Spans>) -> std::sync::MutexGuard<'static, Spans> {
+    let _wait = crate::frame_why::span(crate::frame_why::Phase::Mapping);
     s.waiting += 1;
     let mut s = SPANS_LEFT.wait(s).unwrap_or_else(|e| e.into_inner());
     s.waiting -= 1;
@@ -1474,6 +1475,7 @@ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
         }
         Held::Bytes(Span(id, true))
     } else {
+        let _wait = crate::frame_why::span(crate::frame_why::Phase::Mapping);
         Held::All(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
     };
     REMAPS[0].fetch_add(1, Relaxed);
@@ -1493,6 +1495,7 @@ pub struct Reading(#[allow(dead_code)] Held<std::sync::RwLockReadGuard<'static, 
 /// nor held across anything that maps title memory.
 pub fn title_memory_reading(at: usize, len: usize) -> Reading {
     if !by_range() {
+        let _wait = crate::frame_why::span(crate::frame_why::Phase::Mapping);
         return Reading(Held::All(MAPPING.read().unwrap_or_else(|e| e.into_inner())));
     }
     let end = at.saturating_add(len);

@@ -116,6 +116,7 @@ struct List {
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
     uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    queries: std::sync::OnceLock<crate::query_why::Recording>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     /// Draw state is used by the title's calls on one thread at a time, like
@@ -146,6 +147,7 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// is a host GPU.
 #[cfg(windows)]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    let _recording = crate::frame_why::span(crate::frame_why::Phase::Record);
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -614,6 +616,7 @@ fn new_list(
         pipeline_shadow: [0; 8],
         newer: [0; 256],
         uploads: Default::default(),
+        queries: Default::default(),
         #[cfg(windows)]
         host: crate::host::host().and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
@@ -670,6 +673,10 @@ extern "system" fn close(this: This) -> HRESULT {
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
     if allocator.is_null() {
         return E_INVALIDARG;
+    }
+    if crate::frame_why::enabled() {
+        // SAFETY: Reset has exclusive access to the command list recording.
+        let _ = unsafe { &mut *this.cast_mut().cast::<List>() }.queries.take();
     }
     // A wait recorded and never submitted goes with the recording.
     VALUE_WAITS
@@ -902,6 +909,7 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        crate::query_why::access(src as usize, src_offset, src_offset.saturating_add(len), true);
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -966,6 +974,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
+            crate::query_why::access(src as usize, 0, a.min(b), true);
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
@@ -1463,7 +1472,25 @@ extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
 
 /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
 /// resolved.
-extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
+fn query_mark(this: This, heap: This, kind: u32, index: u32, begin: bool) {
+    if crate::frame_why::enabled() && !this.is_null() {
+        // SAFETY: receiver of a command list method.
+        let list = unsafe { &*this.cast::<List>() };
+        list.queries.get_or_init(Default::default).mark(heap as usize, kind, index, begin);
+    }
+}
+extern "system" fn query_begin(this: This, heap: This, kind: u32, index: u32) {
+    query_mark(this, heap, kind, index, true);
+}
+extern "system" fn query_end(this: This, heap: This, kind: u32, index: u32) {
+    query_mark(this, heap, kind, index, false);
+}
+fn query_draw(this: This, elements: Option<u64>) {
+    if crate::frame_why::enabled() && !this.is_null() {
+        // SAFETY: receiver of a command list recording call.
+        if let Some(q) = unsafe { &*this.cast::<List>() }.queries.get() { q.draw(elements); }
+    }
+}
 
 /// `ResolveQueryData(heap, type, first, count, buffer, offset)`: writes
 /// each query's result into the buffer once the list has run. Timestamps
@@ -1474,9 +1501,9 @@ extern "system" fn query_mark(_: This, _heap: This, _kind: u32, _index: u32) {}
 /// not measured ones (time spans come out as the submission's length).
 extern "system" fn resolve_queries(
     this: This,
-    _heap: This,
+    heap: This,
     kind: u32,
-    _first: u32,
+    first: u32,
     count: u32,
     buffer: This,
     offset: u64,
@@ -1485,6 +1512,7 @@ extern "system" fn resolve_queries(
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
+    if crate::frame_why::enabled() { crate::query_why::resolve(heap as usize, kind, first, count); }
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
@@ -1501,6 +1529,7 @@ extern "system" fn resolve_queries(
     if end > size {
         return;
     }
+    if crate::frame_why::enabled() { crate::query_why::destination(kind, buffer as usize, offset, end); }
     for i in 0..u64::from(count) {
         // Wider results are written as 8-byte pieces.
         for piece in 0..bytes / 8 {
@@ -1711,6 +1740,7 @@ mod state {
         first: u32,
         first_instance: u32,
     ) {
+        super::query_draw(this, Some(u64::from(vertices) * u64::from(instances)));
         super::count_draw();
         with_state(this, |list, s| {
             s.draw(list, vertices, instances, first, first_instance)
@@ -1723,6 +1753,7 @@ mod state {
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
+        super::query_draw(this, None);
         super::count_draw();
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1740,6 +1771,7 @@ mod state {
         indirect: u64,
         _payload: u64,
     ) {
+        super::query_draw(this, None);
         super::count_draw();
         if indirect != 0 {
             static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1756,6 +1788,7 @@ mod state {
         base: i32,
         first_instance: u32,
     ) {
+        super::query_draw(this, Some(u64::from(indices) * u64::from(instances)));
         super::count_draw();
         with_state(this, |list, s| {
             s.draw_indexed(list, indices, instances, first, base, first_instance)
@@ -1799,7 +1832,8 @@ fn count_draw() {
 /// dispatches, counted per frame for the log.
 /// shortcut: dropped until their shaders translate (decision 0007).
 #[cfg(not(windows))]
-extern "system" fn draw(_: This) {
+extern "system" fn draw(this: This) {
+    query_draw(this, None);
     count_draw();
 }
 
@@ -1825,6 +1859,7 @@ extern "system" fn execute_indirect(
     let Some((stride, args)) = crate::signature::layout(signature) else {
         return;
     };
+    if matches!(args, [[0 | 1 | 10, ..]]) { query_draw(this, None); }
     let address = crate::resource::buffer_bytes(arguments).map(|(p, _)| p as u64 + offset);
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
@@ -2240,8 +2275,8 @@ const METHODS: [(usize, *const ()); 52] = [
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
 const MORE_METHODS: [(usize, *const ()); 9] = [
-    (28, query_mark as *const ()),             // 0xe0 BeginQuery
-    (29, query_mark as *const ()),             // 0xe8 EndQuery
+    (28, query_begin as *const ()),             // 0xe0 BeginQuery
+    (29, query_end as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0
     (78, dispatch_x as *const ()),             // 0x270
     (98, state::dispatch_mesh_x as *const ()), // 0x310

@@ -2464,6 +2464,7 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        crate::query_why::forget(std::ptr::from_ref(self) as usize);
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
@@ -2857,7 +2858,7 @@ extern "system" fn resource_release(this: This) -> u32 {
 /// still landing, even when the caller already has its pointer.
 extern "system" fn map(this: This, _sub: u32, read: *const c_void, out: *mut *mut u8) -> HRESULT {
     #[cfg(windows)]
-    if crate::host::feedback::enabled() || crate::host::frame_end::why() || crate::host::back_age::enabled() {
+    if crate::host::feedback::enabled() || crate::host::frame_end::why() || crate::host::back_age::enabled() || crate::frame_why::enabled() {
         let r = resource(this);
         if r.desc.dimension == BUFFER {
             let size = r.desc.width as usize;
@@ -2865,6 +2866,7 @@ extern "system" fn map(this: This, _sub: u32, read: *const c_void, out: *mut *mu
             // D3D12_RANGE of two SIZE_Ts. An empty range is write-only.
             let [from, to] = unsafe { read.cast::<[usize; 2]>().as_ref() }.copied().unwrap_or([0, size]);
             if from < to && from < size {
+                crate::query_why::access(this as usize, from as u64, to.min(size) as u64, false);
                 let base = r.data() as usize;
                 let range = (base.saturating_add(from), base.saturating_add(to.min(size)));
                 if crate::host::frame_end::why() { crate::host::frame_end::map_intent(range.0, range.1); }

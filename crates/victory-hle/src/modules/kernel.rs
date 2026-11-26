@@ -191,6 +191,11 @@ fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
     let len = host::get_module_file_name_w(module, path.as_mut_ptr(), path.len() as u32) as usize;
     let path = String::from_utf16_lossy(&path[..len.min(path.len())]);
     let file = path.rsplit('\\').next()?;
+    #[cfg(windows)]
+    if let Some(observer) = victory_gpu::wait_timing::observer(file, &symbol)
+        && !host::get_proc_address(module, name).is_null() {
+        return Some(observer as *mut c_void);
+    }
     crate::registry::lookup(file, &symbol).map(|address| address as *mut c_void)
 }
 

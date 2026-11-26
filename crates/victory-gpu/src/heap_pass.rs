@@ -134,17 +134,25 @@ impl<C: Clone> Picked<C> {
                 );
             }
         }
+        let mut different = 0;
         for (&slot, kept) in &self.slots {
             if record(slot) != Some(kept.record) {
+                different += 1;
                 due.insert(slot);
             }
         }
         let orphans_too = pass.is_multiple_of(ORPHANS_EVERY);
         for (&slot, &seen) in &self.orphans {
-            if orphans_too || record(slot) != Some(seen) {
+            if orphans_too {
+                due.insert(slot);
+            } else if record(slot) != Some(seen) {
+                different += 1;
                 due.insert(slot);
             }
         }
+        let compared = self.slots.len() + if orphans_too { 0 } else { self.orphans.len() };
+        crate::frame_why::count(crate::frame_why::Count::Checked, compared as u64);
+        crate::frame_why::count(crate::frame_why::Count::Changed, different);
         let mut due: Vec<u32> = due.into_iter().collect();
         due.sort_unstable();
         due

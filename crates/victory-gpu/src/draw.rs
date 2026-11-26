@@ -368,6 +368,8 @@ pub(crate) struct State {
     /// the list's place when it is submitted) the list's title-write epoch
     /// then: after a title write in between, the table is made again.
     fresh_tables: std::collections::HashMap<(u64, u32, u32, u64), (u32, Option<u64>)>,
+    // Last observed contents/format hash for this span, only populated with WHY2.
+    why_table_hash: std::collections::HashMap<(u64, u32, u32), u64>,
     /// First physical slot of an identical table filled from title memory
     /// in this host list, since the same last deferred title write.
     upload_tables: std::collections::HashMap<UploadTable, u32>,
@@ -575,6 +577,7 @@ impl State {
             self.release_from(0);
         }
         self.fresh_tables.clear();
+        self.why_table_hash.clear();
         self.clear_upload_tables();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
@@ -1440,7 +1443,8 @@ impl State {
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        let same_pipeline = self.host_pipeline == p.pso.as_raw() as usize;
+        if !same_pipeline {
             // SAFETY: an open list and a live pipeline.
             unsafe { l.SetPipelineState(&p.pso) };
             self.host_pipeline = p.pso.as_raw() as usize;
@@ -1497,6 +1501,8 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
+                crate::frame_why::count(crate::frame_why::Count::Root, 1);
+                if same_pipeline { crate::frame_why::count(crate::frame_why::Count::RootsSame, 1); }
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
@@ -2773,6 +2779,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        Self::why_culling(p);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if self.ambient(list, p) {
             // Our pass set its own pipeline, root signature and heap: the next bind sets the title's again
@@ -3096,17 +3103,8 @@ impl State {
         }
     }
 
-    /// The walls trace (`crate::host::walls_trace`): one log line per
-    /// frame with the draws of its main pass (four or more colour targets)
-    /// by scissor rectangle, and how often each of the title's culling
-    /// programs was dispatched. The title clips what it draws
-    /// through a window or door to that opening's rectangle while it holds
-    /// the camera to be in a room (run 182, frame 1529: 1,386 draws under
-    /// `531 0 1789 1337`); in a launch without the room's walls the same
-    /// shot has no such rectangle (run 187, frame 1414). The line shows
-    /// the frame in which that changes.
-    fn walls_census(&self, p: &HostPipeline, compute: bool) {
-        const CULL: [(&str, &str); 9] = [
+    // Shared classification for the walls trace and the aggregate dispatch counts.
+    const CULL: [(&'static str, &'static str); 9] = [
             ("55679a0547649d0b", "tree"),
             ("89d08e561897d4e5", "tree_imposter"),
             ("9209777e8face9dd", "grass"),
@@ -3117,6 +3115,27 @@ impl State {
             ("9146291b38ea9ce1", "meshlet_args"),
             ("42683eebec081520", "depth_pyramid_cpu_occlusion"),
         ];
+    fn why_culling(p: &HostPipeline) {
+        if crate::frame_why::enabled() {
+            for (i, &(hash, _)) in Self::CULL.iter().enumerate() {
+                if p.stages.iter().any(|s| s.shader.hash.as_str() == hash) {
+                    crate::frame_why::CULL[i].fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// The walls trace (`crate::host::walls_trace`): one log line per
+    /// frame with the draws of its main pass (four or more colour targets)
+    /// by scissor rectangle, and how often each of the title's culling
+    /// programs was dispatched. The title clips what it draws
+    /// through a window or door to that opening's rectangle while it holds
+    /// the camera to be in a room (run 182, frame 1529: 1,386 draws under
+    /// `531 0 1789 1337`); in a launch without the room's walls the same
+    /// shot has no such rectangle (run 187, frame 1414). The line shows
+    /// the frame in which that changes.
+    fn walls_census(&self, p: &HostPipeline, compute: bool) {
+        let cull = &Self::CULL;
         type Census = (u64, std::collections::BTreeMap<[i32; 4], u32>, [u32; 9]);
         static CENSUS: std::sync::Mutex<Census> =
             std::sync::Mutex::new((u64::MAX, std::collections::BTreeMap::new(), [0; 9]));
@@ -3133,7 +3152,7 @@ impl State {
                     .map(|(r, n)| format!("{} {} {} {} x{n}", r[0], r[1], r[2], r[3]))
                     .collect();
                 let counts = census.2;
-                let culling: Vec<String> = CULL
+                let culling: Vec<String> = cull
                     .iter()
                     .zip(counts)
                     .filter(|(_, n)| *n > 0)
@@ -3153,7 +3172,7 @@ impl State {
             census.2 = [0; 9];
         }
         if compute {
-            for (i, c) in CULL.iter().enumerate() {
+            for (i, c) in cull.iter().enumerate() {
                 if p.stages.iter().any(|s| s.shader.hash.as_str() == c.0) {
                     census.2[i] += 1;
                 }
@@ -3395,11 +3414,18 @@ impl State {
             };
             // (Review of 2026-11-25, item 4: the constants filled
             // for an earlier draw predate a title write since.)
-            if let Some(&(base, epoch)) = self.fresh_tables.get(&key)
+            use crate::frame_why::{self, Count};
+            let previous = if frame_why::enabled() {
+                frame_why::count(Count::Hash, 1);
+                self.why_table_hash.insert((table,start,end), key.3)
+            } else { None };
+            let cached = self.fresh_tables.get(&key).copied();
+            if let Some((base, epoch)) = cached
                 && epoch.is_none_or(|e| e == list.title_write_epoch())
             {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::DynamicTableHits, 1);
+                frame_why::count(Count::Hit, 1);
                 for u in entries.iter() {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     let Some(view) = crate::descriptor::view(handle) else {
@@ -3456,6 +3482,7 @@ impl State {
                 None
             };
             if let Some(first) = upload.as_ref().and_then(|k| self.upload_tables.get(k)).copied() {
+                frame_why::count(Count::Alias, 1);
                 let base = first - start;
                 let epoch = upload.as_ref().filter(|k| k.slots.iter().any(Option::is_some)).map(|k| k.epoch);
                 self.fresh_tables.insert(key, (base, epoch));
@@ -3471,6 +3498,7 @@ impl State {
             if reuse_upload_slices()
                 && let Some(first) = upload.as_ref().and_then(|k| self.upload_slices.find(k))
             {
+                frame_why::count(Count::Slice, 1);
                 // Recheck the epoch and eligibility on each hit. A later
                 // GPU copy of a constant cannot use this upload snapshot.
                 #[cfg(feature = "diagnostics")]
@@ -3480,6 +3508,15 @@ impl State {
                 }
                 made.push((slot, (first - start) * 32));
                 continue;
+            }
+            if frame_why::enabled() {
+                let reason = match previous {
+                    _ if cached.is_some() => Count::Epoch,
+                    None => Count::NewSpan,
+                    Some(hash) if hash != key.3 => Count::Content,
+                    Some(_) => Count::Uncached,
+                };
+                frame_why::count(reason, 1);
             }
             #[cfg(feature = "diagnostics")]
             {
@@ -4083,6 +4120,7 @@ impl State {
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
         if kind == DISPATCH {
+            Self::why_culling(p);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);

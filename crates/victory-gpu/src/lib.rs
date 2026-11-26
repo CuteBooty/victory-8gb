@@ -31,6 +31,11 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+#[cfg(windows)]
+pub mod wait_timing;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod frame_why;
+mod query_why;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod heap_pass;
 #[cfg(windows)]

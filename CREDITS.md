@@ -110,6 +110,7 @@ removed, and the one change below that was inspired by XCL was written anew.
 | Yorivel | copy-backs into write-watched memory not read as title writes (`VICTORY_BACK_QUIET`, off; ported) | fork PR 1188 (`0460bf53`) |
 | RyanCase94 | physical pages taken from sections of up to 2 MiB (`VICTORY_SECTION_MB`, default 2; idea and patch, ported) | fork issue 1089 |
 | Exopus | retries and fresh texture slots picked in turns (`VICTORY_PICK_TURNS`, off; ported) | fork PR 1246 (`faf709b5`) |
+| lichenlang89 | a raw buffer view's range stays inside its buffer, with counters (`VICTORY_RAW_VIEW_CLAMP`, on; ported) | fork PR 1266 (`dd5e8c9e`) |
 
 ## Geckomacabre/vx-layer
 
@@ -212,6 +213,11 @@ given (`VICTORY_INPUT_WHY`).
 Written for this tree since the second snapshot: the hand ports of fork PRs
 1188 and 1246 and of fork issue 1089 named above; and a read-back age probe
 (`VICTORY_BACK_LATCH`, off; counters only, it changes no behaviour).
+
+Written for this tree since the third snapshot: the hand port of fork PR 1266
+named above; and the counters behind `VICTORY_FRAME_WHY2` (queries, culling
+dispatches, the title's and the worker's timelines, descriptor work by
+cause; they change no behaviour).
 
 Several contributors' own commits also say they were written with AI
 assistance (Claude Code, OpenAI Codex); commits in triippywhale's fork carry

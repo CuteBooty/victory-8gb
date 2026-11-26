@@ -65,7 +65,11 @@ enum Held {
 static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(windows)]
-pub(crate) type Prepared = std::sync::mpsc::SyncSender<()>;
+pub(crate) type Prepared = std::sync::mpsc::SyncSender<Ack>;
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub(crate) enum Ack { Prepared, RunnablePrefix }
 
 #[cfg(windows)]
 fn safe_submit() -> bool {
@@ -146,6 +150,7 @@ fn forces() -> bool {
 /// there, now and whenever a submission has run.
 #[cfg(windows)]
 fn submit_cut(this: This, lists: &[This]) {
+    let _submit = crate::frame_why::span(crate::frame_why::Phase::SubmitCall);
     let Some(host) = crate::host::host() else {
         return;
     };
@@ -217,7 +222,10 @@ fn submit_cut(this: This, lists: &[This]) {
             wake(Some(tx));
             if rx.try_recv().is_err() {
                 let start = std::time::Instant::now();
-                rx.recv().expect("submit worker stopped during preparation");
+                let why = crate::frame_why::span(crate::frame_why::Phase::Ack);
+                let ack = rx.recv().expect("submit worker stopped during preparation");
+                drop(why);
+                crate::frame_why::ack(matches!(ack, Ack::RunnablePrefix), start);
                 PREPARE_WAITS[0].fetch_add(1, Ordering::Relaxed);
                 PREPARE_WAITS[1].fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
@@ -234,7 +242,7 @@ fn enqueue_parts(
     held: &mut Vec<Held>,
     parts: crate::list::Parts,
     wait_for_reads: bool,
-) -> Option<(Prepared, std::sync::mpsc::Receiver<()>)> {
+) -> Option<(Prepared, std::sync::mpsc::Receiver<Ack>)> {
     if parts.is_empty() {
         return None;
     }
@@ -430,11 +438,13 @@ fn wake(prepared: Option<Prepared>) {
 /// to run, each time something was added or a fence moved.
 #[cfg(windows)]
 fn worker() {
+    crate::frame_why::role(crate::frame_why::Role::Submit);
     let mut waiting = Vec::new();
     loop {
         {
             let mut work = lock(&WORK.0);
             while !work.pending {
+                let _idle = crate::frame_why::span(crate::frame_why::Phase::Idle);
                 work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
             }
             work.start_pass(&mut waiting);
@@ -443,7 +453,7 @@ fn worker() {
         // A still-held part needs a future signal, possibly from the
         // submitting thread. Its inputs follow the queue's fence lifetime.
         for tx in waiting.drain(..) {
-            let _ = tx.try_send(());
+            let _ = tx.try_send(Ack::RunnablePrefix);
         }
     }
 }
@@ -487,7 +497,9 @@ fn release_held_now(all: bool) {
     if lock(&WAITING).is_empty() {
         return;
     }
+    let submit_lock = crate::frame_why::span(crate::frame_why::Phase::SubmitLock);
     let _one = lock(&RELEASING);
+    drop(submit_lock);
     let was_here = RELEASING_HERE.replace(true);
     struct Leave(bool);
     impl Drop for Leave {
@@ -970,6 +982,7 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    let drain = crate::frame_why::drain();
     #[cfg(windows)]
     crate::host::back_age::begin_present();
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1038,6 +1051,7 @@ extern "system" fn present(
     }
     #[cfg(windows)]
     let barrier_end = crate::host::frame_end::end_wait();
+    drop(drain);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
@@ -1104,7 +1118,9 @@ extern "system" fn present(
             let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
             (r, t, was)
         });
+        let display = crate::frame_why::span(crate::frame_why::Phase::Display);
         let shown = host.present(texture, state, frame, full_wait, over.map(|(_, t, was)| (t, was)));
+        drop(display);
         if let Some((r, _, was)) = over {
             crate::resource::host_transition(r, was);
         }
@@ -1123,15 +1139,20 @@ extern "system" fn present(
     // (the submit thread's release under way is waited for there), so they
     // are in the line. No lock of ours is held here.
     #[cfg(windows)]
-    crate::host::settle_backs(upto);
+    {
+        let _drain = crate::frame_why::drain();
+        crate::host::settle_backs(upto);
+    }
     #[cfg(windows)]
     if let Some(b) = boundary { b.report(barrier_end, full_wait); }
     #[cfg(windows)]
     if crate::host::back_age::enabled() {
         crate::host::back_age::end_present(&PRESENTS_DONE);
+        crate::frame_why::frame();
         return S_OK;
     }
     PRESENTS_DONE.fetch_add(1, Ordering::Release);
+    crate::frame_why::frame();
     S_OK
 }
 
@@ -1406,8 +1427,8 @@ mod tests {
         assert!(matches!(&held[1], Held::Run(_, _, None)));
         let Held::Run(_, _, Some(done)) = &held[2] else { panic!("missing final part") };
         assert!(first.try_recv().is_err());
-        done.try_send(()).unwrap();
-        first.try_recv().unwrap();
+        done.try_send(Ack::Prepared).unwrap();
+        assert!(matches!(first.try_recv(), Ok(Ack::Prepared)));
         assert!(matches!(&held[3], Held::Run(_, _, None)));
         assert!(matches!(&held[4], Held::Run(_, _, Some(_))));
         assert!(second.try_recv().is_err());
@@ -1424,13 +1445,13 @@ mod tests {
         work.start_pass(&mut waiting);
         work.submitters.push(second);
         for done in waiting.drain(..) {
-            done.try_send(()).unwrap();
+            done.try_send(Ack::RunnablePrefix).unwrap();
         }
-        a.try_recv().unwrap();
+        assert!(matches!(a.try_recv(), Ok(Ack::RunnablePrefix)));
         assert!(b.try_recv().is_err());
         work.start_pass(&mut waiting);
-        waiting[0].try_send(()).unwrap();
-        b.try_recv().unwrap();
+        waiting[0].try_send(Ack::RunnablePrefix).unwrap();
+        assert!(matches!(b.try_recv(), Ok(Ack::RunnablePrefix)));
     }
 
     /// Where a queue's signal is: newer layouts have it two slots later.

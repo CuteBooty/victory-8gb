@@ -78,7 +78,13 @@ impl HostPolicy {
         if !self.allows(dll) {
             return None;
         }
-        imp::resolve(dll, symbol)
+        let address = imp::resolve(dll, symbol)?;
+        #[cfg(windows)]
+        if let ImportSymbol::Name { name, .. } = symbol
+            && let Some(observer) = victory_gpu::wait_timing::observer(dll, name) {
+            return Some(observer);
+        }
+        Some(address)
     }
 }
 

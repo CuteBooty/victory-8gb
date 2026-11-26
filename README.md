@@ -36,6 +36,10 @@ switches in the table below.
   no screen recorder): 154 ms at 3,000-5,000 draws, 187 ms at 5,000-7,000,
   223 ms at 7,000-9,000 and 228 ms above 9,000; none of its 88 samples was
   over 350 ms. One run, and not a heavy session.
+- Runs of 2026-11-26 with the same switches, by draw count: 155-163 ms at
+  3,000-5,000 draws, 184-203 ms at 5,000-7,000, 201-214 ms at 7,000-9,000.
+  Different places and different play (walking, driving, swimming), so these
+  are a range and not a comparison.
 
 ## New in the first snapshot (compared with the fork it is based on)
 
@@ -124,11 +128,72 @@ Measured on the test machine (5-second log lines; weak evidence):
   without it.
 - No gain in steady frame time over the earlier snapshots is proven.
 
+## What changed since the third snapshot
+
+Nothing here makes the tree faster. This snapshot adds one correctness fix,
+a set of counters, and what a night of measurements on the test machine
+showed (2026-11-26).
+
+- A raw buffer view whose range runs past its buffer is now kept inside it
+  or left null, instead of being handed to the driver as a description it
+  refuses (fork PR 1266, ported; `VICTORY_RAW_VIEW_CLAMP`, on by default,
+  `0` restores the old descriptors). Eight counters in the 5-second line say
+  how often it happens. On the test machine they stayed at zero for a whole
+  run, so the fix changes nothing there; it is included for other cards.
+- Counters behind `VICTORY_FRAME_WHY2=1` (off; no behaviour change), as
+  5-second lines beginning `why2`: queries by type; the culling compute
+  dispatches; a timeline of the presenting thread, of the title's other
+  threads and of the submit worker and the relay that adds up to the frame;
+  what the worker does while the present drains; the slowest frame of the
+  window; and descriptor work by cause.
+
+What one run with those counters showed (four minutes in town, about 212 ms a
+frame; weak evidence):
+
+- The presenting thread spends 187 of 212 ms inside the present, waiting. It
+  records nothing itself. That wait is not a cost of its own: it is the sum
+  of what follows.
+- About three of the title's other threads are inside this layer's recording
+  code at any moment (637 thread-ms a frame, five callers at 119-132 ms each).
+- The submit worker prepares for 126 ms a frame (240 at worst) and is idle
+  for 71; the relay waits 85 ms for the card and is idle for 88.
+- 235,590 descriptor records are checked a frame and 21,187 of them (9 %)
+  have changed.
+- The title issues about 34 occlusion queries a frame, resolved in one batch,
+  and culls mainly with compute passes. This layer answers every query as
+  "visible".
+
+Tried on the test machine and not adopted (each one or two runs; frame times
+by draw count against runs of the same night):
+
+- The general ticket fix for 2-D compute groups on 32-lane cards (fork PR
+  1261): with the fill light off, shaded areas were as black with it as
+  without it.
+- `VICTORY_HEAP_PASS_UNMARKED=1`: the 8,685 self-marked slot looks a frame go
+  away and the picture is unharmed, but the frame is not shorter (155, 199
+  and 214 ms at 3,000-5,000, 5,000-7,000 and 7,000-9,000 draws over 78
+  samples).
+- `VICTORY_LATE_WAIT=1` and `=0` are both slower than `=2` (about 294 ms and
+  280-357 ms at 5,000-7,000 draws against about 200) and neither flashes. At
+  `0` the submissions are not sent ahead at all. Stages 1 and 2 both let
+  everything land before the present returns; stage 2 is faster earlier in
+  the frame, where a refresh that meets pending shader writes merges only
+  the bytes the title changed instead of waiting for every flight. The
+  flashing belongs to `VICTORY_LATE_WAIT` unset with the relay on.
+- Two experiments that are not in this snapshot: texture refreshes and buffer
+  copies on a pool of four threads, alone and with the write-watch query
+  moved out from under the journal's lock. The threads then queue on the
+  guards' lock (193 thread-ms a frame) and the frame is no shorter (222 ms at
+  7,000-9,000 draws, 272 ms above 9,000).
+
 ## Known problems
 
 - Slow (see the frame times above).
-- The picture's exposure flashes unless `VICTORY_LATE_WAIT=2` is set; that
-  wait costs 70-90 ms a frame in heavy scenes.
+- The picture's exposure flashes when submissions are in flight across the
+  present (`VICTORY_LATE_WAIT` unset with the relay on). The recommended
+  `VICTORY_LATE_WAIT=2` lets everything land before the present returns; the
+  presenting thread then waits there for most of the frame (see the counters
+  above), which is the frame's other work and not a separate cost.
 - Hitches while driving. The texture refresh's wait for the title's memory
   remaps is gone with the default 2 MiB sections; other hitches remain, and
   their cause is not yet found.
@@ -141,6 +206,11 @@ Measured on the test machine (5-second log lines; weak evidence):
 - Leaf edges, hair and thin wires look speckled or dotted, on every build of
   this tree so far.
 - Foliage looks dotted in Series S.
+- Water can be drawn white for a minute or two after arriving at it, then
+  fills in.
+- At 5 fps a quick press of some buttons (crouch) is not always taken by the
+  title although the press is delivered; holding the button for a second
+  works.
 - Eight compute programs are refused by the translator.
 - No autosave was seen during a mission.
 - The first launch after a change to the shader translator translates every
@@ -212,6 +282,8 @@ Defaults as the code reads them. "On" switches are turned off with `=0`;
 | `VICTORY_PICK_TURNS` | off | texture retries and fresh texture slots are picked in turns |
 | `VICTORY_BACK_LATCH` | off | 5-second counters of how old read-backs are when the present returns (diagnostic; changes no behaviour) |
 | `VICTORY_AMBIENT` | off | a constant least amount of indirect light in place of the title's bounced light; `=<level>` sets it (0.6 recommended, `0` is none, an unreadable value means 0.6) |
+| `VICTORY_RAW_VIEW_CLAMP` | on | a raw buffer view stays inside its buffer: a range past the end is shortened to the whole dwords that fit, an unaligned or empty one becomes a null view; `0`: the old descriptors, and no counting |
+| `VICTORY_FRAME_WHY2` | off | 5-second lines beginning `why2`: queries, culling dispatches, the title's and the worker's timelines, descriptor work by cause (diagnostic; changes no behaviour) |
 
 ## Building
 
