@@ -42,14 +42,19 @@ Windows 11, NVIDIA RTX 3070 8 GB (driver 621.24), AMD Ryzen 5 3600 (6 cores /
 12 threads), 32 GB RAM; the title's Series S mode at 1920x1080 output, with the
 switches in the table below. One PC; your numbers will differ.
 
-- Longest session: 104 minutes on 2026-11-25, without a crash and with 0
-  logged errors; the first Chapter I mission was played through and saved by
-  hand.
-- 2026-11-26: 43 runs, 0 logged errors, no device loss, no crash.
+- Longest session: 5 hours 45 minutes on 2026-11-26 (free roaming at night,
+  then a long taxi ride left running), closed by hand, without a crash and
+  with 0 logged errors. The process's private memory grew slowly over it
+  (about 20 GB after two hours, 22.6 GB near the end; one run). On
+  2026-11-25 the first Chapter I mission was played through in a 104-minute
+  session and saved by hand.
+- 2026-11-26: 51 runs, 0 logged errors, no device loss, no crash.
 - Frame times on the reference scene (afternoon, parking lot, recommended
   set), as medians of the log's 5-second lines by draws per frame: 205-215 ms
   at 7,000-9,000 draws, about 140 ms at 3,000-5,000 and about 115-120 ms at
-  1,000-3,000. Night scenes are flatter (the fill light). The picture is low
+  1,000-3,000 (measured with `VICTORY_AMBIENT=0.6`, which is no longer in
+  the recommended set; see "What changed since the seventh snapshot"). The
+  picture is low
   resolution, with weak edge anti-aliasing on thin geometry (power lines,
   leaves). On this machine the dense frame is mostly CPU time.
 
@@ -333,14 +338,40 @@ day (one save, one PC, short runs):
 
 The picture was the same in all of them.
 
+## What changed since the seventh snapshot
+
+No code change: the recommended settings and this README only.
+
+- **`VICTORY_AMBIENT=0.6` is no longer in the recommended set.** It was
+  added in the third snapshot to make shaded areas readable by day. At night
+  the same constant fill lifts every dark surface to one grey: headlights
+  and street lamps no longer stand out, and the scene looks flat. On the
+  same save at night, the same build without it (`VICTORY_AMBIENT` unset or
+  `off`) was judged far better in play; a session of 5 hours 45 minutes was
+  then played and left running that way. The frame-time medians did not show
+  a cost or a gain from the change (different scenes; not a like-for-like
+  measurement).
+- Not yet compared: daytime without the fill. Expect surfaces facing away
+  from the light, and some interiors, to be close to black (seen at night: a
+  backlit character's back, the side of a character away from headlights).
+  If daytime shade is too dark for you, set `VICTORY_AMBIENT=0.6` again, or
+  try the experimental `VICTORY_AMBIENT_SKY=1` with it, which lets the fill
+  follow the sky's brightness.
+- In the title's own settings menu: motion blur off and camera bobbing off
+  were judged to feel much better at these frame rates.
+- In that long session the card was at its texture budget for the first two
+  hours (textures waited for room); none were logged waiting in the
+  remaining hours.
+
 ## Known problems
 
 - Slow (see the frame times above).
 - Occasionally a single object or face shows a black texture that pops in
   and out.
-- Flat lighting, most visible at dusk and indoors: the title's ray-traced
-  bounce light does not run on 32-lane cards, and `VICTORY_AMBIENT` is only a
-  fill light.
+- No bounced light: the title's ray-traced bounce light does not run on
+  32-lane cards. Without a fill, shade is close to black; with
+  `VICTORY_AMBIENT` the lighting is flat, worst at night (no longer
+  recommended; see "What changed since the seventh snapshot").
 - Once, on the very first launch, one NPC's face was missing; it was there
   after the restart.
 - The opening cutscene runs at about 2 fps (see "First launch").
@@ -356,8 +387,8 @@ The picture was the same in all of them.
 - Shaded areas are black without `VICTORY_AMBIENT`: the title's bounced light
   does not run. `VICTORY_AMBIENT=0.6` covers part of it with a constant fill,
   the same everywhere: many shaded areas become readable, but shadows cast on
-  open ground and some building fronts stay close to black. Real bounced
-  light still does not run.
+  open ground and some building fronts stay close to black, and night scenes
+  turn flat and grey. Real bounced light still does not run.
 - Leaf edges, hair and thin wires look speckled or dotted, on every build of
   this tree so far.
 - Foliage looks dotted in Series S.
@@ -399,7 +430,6 @@ in a comment where the code reads it.
 | `VICTORY_COPY_PLAIN=1` | copies of title memory into host buffers are made in place by this process, with the kernel's copy behind them for a page that is not there |
 | `VICTORY_FILLS_PLAIN=1` | a list's fills of under 256 bytes are copied in place instead of through the kernel's copy (needs `VICTORY_COPY_PLAIN=1`) |
 | `VICTORY_REUSE_TARGET_BINDS=1` | repeated bindings of the same output targets are skipped |
-| `VICTORY_AMBIENT=0.6` | where the title's ray-traced light probes would supply bounced light (they do not run here), a constant least amount of indirect light is used instead, the same everywhere; it is not real bounced light |
 | `VICTORY_CARD_REHASH_RUNS=1` | the hash passes that check the card's copies of title buffers run once per run of changed pieces instead of once per range (used in the best run above; its own share of that run's frame times is not separated yet) |
 
 If materials look wrong, `VICTORY_TABLE_CONSTANTS=0` turns off reading table
@@ -438,7 +468,7 @@ Defaults as the code reads them. "On" switches are turned off with `=0`;
 | `VICTORY_BACK_QUIET` | off | copy-backs into write-watched memory are not read as title writes (known race: a title write to the same 4 KiB page between the query and the reset can be missed) |
 | `VICTORY_PICK_TURNS` | off | texture retries and fresh texture slots are picked in turns |
 | `VICTORY_BACK_LATCH` | off | 5-second counters of how old read-backs are when the present returns (diagnostic; changes no behaviour) |
-| `VICTORY_AMBIENT` | off | a constant least amount of indirect light in place of the title's bounced light; `=<level>` sets it (0.6 recommended, `0` is none, an unreadable value means 0.6) |
+| `VICTORY_AMBIENT` | off | a constant least amount of indirect light in place of the title's bounced light; `=<level>` sets it (`0.6` was in the recommended set until the seventh snapshot: readable shade by day, flat and grey at night; `0` is none, an unreadable value means 0.6); where the title's ray-traced light probes would supply bounced light (they do not run here), it is the same everywhere and not real bounced light |
 | `VICTORY_RAW_VIEW_CLAMP` | on | a raw buffer view stays inside its buffer: a range past the end is shortened to the whole dwords that fit, an unaligned or empty one becomes a null view; `0`: the old descriptors, and no counting |
 | `VICTORY_FRAME_WHY2` | off | 5-second lines beginning `why2`: queries, culling dispatches, the title's and the worker's timelines, descriptor work by cause; since the fifth snapshot also settle causes, heap-slot counts, submit worker idle time and guard-lock hold durations (diagnostic; changes no behaviour; the timeline is approximate relay observations, not exact frame attribution) |
 | `VICTORY_UPSCALE_HISTORY` | off | Series S: blends each stretched frame with the previous ones before the interface is drawn; `=<blend>` from 0 to 1 is the most weight history may have (0.9 with `_MV=2`, 0.5 with `_MV=1`) |
