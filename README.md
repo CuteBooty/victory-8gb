@@ -351,12 +351,30 @@ No code change: the recommended settings and this README only.
   then played and left running that way. The frame-time medians did not show
   a cost or a gain from the change (different scenes; not a like-for-like
   measurement).
-- Not yet compared: daytime without the fill. Expect surfaces facing away
-  from the light, and some interiors, to be close to black (seen at night: a
-  backlit character's back, the side of a character away from headlights).
-  If daytime shade is too dark for you, set `VICTORY_AMBIENT=0.6` again, or
-  try the experimental `VICTORY_AMBIENT_SKY=1` with it, which lets the fill
-  follow the sky's brightness.
+- Daytime without the fill was then compared on the reference scene
+  (afternoon, parking lot) and judged fine; 216 ms at 7,000-9,000 draws
+  (3 lines) against 215 with the fill (5 lines). Surfaces facing away from
+  the light can be close to black (seen at night: a backlit character's
+  back, the side of a character away from headlights). If shade is too dark
+  for you, set `VICTORY_AMBIENT=0.6` again, or try the experimental
+  `VICTORY_AMBIENT_SKY=1` with it, which lets the fill follow the sky's
+  brightness.
+- **`VICTORY_UPSCALE_HISTORY=0.85` with `VICTORY_UPSCALE_HISTORY_MV=2` is now
+  in the recommended set** (Series S; both exist since the fifth snapshot).
+  Edges, wires and foliage are much steadier; in play it was judged a far
+  better picture, and the most wanted improvement so far. Compared on the
+  reference scene, one short run each, medians at 7,000-9,000 draws:
+
+  | History | ms a frame | Lines | Judged |
+  |---|---|---|---|
+  | `0.85`, `_MV=2` (follows motion) | 215 | 4 | best picture, moves well |
+  | off | 226 | 7 | much worse picture |
+  | `0.85`, `_MV=1` (colour clamp only) | 215 | 13 | motion unacceptable |
+
+  No measurable cost: it is one pass on the card, and preparing time was the
+  same with it on and off (98 and 99 ms). On a night drive the frame felt
+  slower with it; the comparison above does not show that, so it was more
+  likely the scene.
 - In the title's own settings menu: motion blur off and camera bobbing off
   were judged to feel much better at these frame rates.
 - In that long session the card was at its texture budget for the first two
@@ -431,6 +449,8 @@ in a comment where the code reads it.
 | `VICTORY_FILLS_PLAIN=1` | a list's fills of under 256 bytes are copied in place instead of through the kernel's copy (needs `VICTORY_COPY_PLAIN=1`) |
 | `VICTORY_REUSE_TARGET_BINDS=1` | repeated bindings of the same output targets are skipped |
 | `VICTORY_CARD_REHASH_RUNS=1` | the hash passes that check the card's copies of title buffers run once per run of changed pieces instead of once per range (used in the best run above; its own share of that run's frame times is not separated yet) |
+| `VICTORY_UPSCALE_HISTORY=0.85` | Series S: each stretched frame is blended with the previous ones before the interface is drawn; 0.85 is the most weight history may have |
+| `VICTORY_UPSCALE_HISTORY_MV=2` | the history follows the title's motion vectors, with depth and colour rejection and a weight per pixel (without it the blend trails badly in motion) |
 
 If materials look wrong, `VICTORY_TABLE_CONSTANTS=0` turns off reading table
 constants in place: every table constant is then copied for the draw into
